@@ -1,0 +1,315 @@
+diff --git a/src/commands.rs b/src/commands.rs
+index 2190f5d..2604031 100644
+--- a/src/commands.rs
++++ b/src/commands.rs
+@@ -261,6 +261,9 @@ pub enum WalletSubCommand {
+ /// Config options wallet operations can take.
+ #[derive(Debug, Args, Clone, PartialEq, Eq)]
+ pub struct WalletOpts {
++    /// Override the chain genesis while retaining the network's address encoding.
++    #[arg(long)]
++    pub genesis_hash: Option<bdk_wallet::bitcoin::BlockHash>,
+     /// Selects the wallet to use.
+     #[arg(skip)]
+     pub wallet: Option<String>,
+diff --git a/src/config.rs b/src/config.rs
+index 685f52d..dfbc849 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -27,6 +27,8 @@ pub struct WalletConfig {
+ #[derive(Debug, Serialize, Deserialize)]
+ pub struct WalletConfigInner {
+     pub network: String,
++    #[serde(default)]
++    pub genesis_hash: Option<bdk_wallet::bitcoin::BlockHash>,
+     pub ext_descriptor: String,
+     pub int_descriptor: Option<String>,
+     #[cfg(any(feature = "sqlite", feature = "redb"))]
+@@ -133,6 +135,7 @@ impl WalletConfigInner {
+             })?;
+ 
+         Ok(WalletOpts {
++            genesis_hash: self.genesis_hash,
+             wallet: Some(wallet_name.to_string()),
+             ext_descriptor: self.ext_descriptor.clone(),
+             int_descriptor: self.int_descriptor.clone(),
+@@ -256,6 +259,7 @@ mod tests {
+         };
+ 
+         let wallet_config = WalletConfigInner {
++            genesis_hash: None,
+             network: "testnet4".to_string(),
+             ext_descriptor: EXT_DESCRIPTOR.to_string(),
+             int_descriptor: Some(INT_DESCRIPTOR.to_string()),
+@@ -344,6 +348,7 @@ mod tests {
+     #[test]
+     fn test_invalid_client_type_fails() {
+         let inner = WalletConfigInner {
++            genesis_hash: None,
+             network: "regtest".to_string(),
+             ext_descriptor: "desc".to_string(),
+             int_descriptor: None,
+diff --git a/src/handlers/config.rs b/src/handlers/config.rs
+index dc1ffb9..4ab77d3 100644
+--- a/src/handlers/config.rs
++++ b/src/handlers/config.rs
+@@ -96,6 +96,7 @@ impl AppCommand<AppContext<Init>> for SaveConfigCommand {
+         };
+ 
+         let wallet_config = WalletConfigInner {
++            genesis_hash: self.wallet_opts.genesis_hash,
+             network: ctx.network.to_string(),
+             ext_descriptor: self.wallet_opts.ext_descriptor.clone(),
+             int_descriptor: self.wallet_opts.int_descriptor.clone(),
+diff --git a/src/handlers/offline.rs b/src/handlers/offline.rs
+index 5250c67..2c6ba2d 100644
+--- a/src/handlers/offline.rs
++++ b/src/handlers/offline.rs
+@@ -150,10 +150,12 @@ impl AppCommand<AppContext<OfflineOperations<'_>>> for TransactionsCommand {
+     type Output = ListResult<TransactionDetails>;
+ 
+     fn execute(&self, ctx: &mut AppContext<OfflineOperations<'_>>) -> Result<Self::Output, Error> {
+-        let transactions = &mut ctx.state.wallet.transactions();
++        let wallet = &ctx.state.wallet;
++        let transactions = &mut wallet.transactions();
+ 
+         let txns: Vec<TransactionDetails> = transactions
+             .map(|tx| {
++                let (sent, received) = wallet.sent_and_received(&tx.tx_node);
+                 let total_value = tx
+                     .tx_node
+                     .output
+@@ -163,6 +165,13 @@ impl AppCommand<AppContext<OfflineOperations<'_>>> for TransactionsCommand {
+ 
+                 TransactionDetails {
+                     txid: tx.tx_node.txid.to_string(),
++                    received: received.to_sat(),
++                    sent: sent.to_sat(),
++                    fee: wallet
++                        .calculate_fee(&tx.tx_node)
++                        .ok()
++                        .map(|fee| fee.to_sat()),
++                    chain_position: serde_json::to_value(tx.chain_position).unwrap_or_default(),
+                     is_coinbase: tx.tx_node.is_coinbase(),
+                     wtxid: tx.tx_node.compute_wtxid().to_string(),
+                     version: serde_json::to_value(tx.tx_node.version).unwrap_or(json!(1)),
+@@ -184,6 +193,83 @@ impl AppCommand<AppContext<OfflineOperations<'_>>> for TransactionsCommand {
+ #[derive(Parser, Debug, PartialEq, Clone)]
+ pub struct BalanceCommand;
+ 
++#[cfg(test)]
++mod wallet_history_tests {
++    use super::*;
++    use bdk_wallet::Wallet;
++    use bdk_wallet::bitcoin::hashes::Hash;
++    use bdk_wallet::bitcoin::{
++        Amount, Network, OutPoint, ScriptBuf, Transaction, TxIn, TxOut, Txid, absolute, transaction,
++    };
++    use std::path::PathBuf;
++
++    #[test]
++    fn history_reports_wallet_amounts_instead_of_all_transaction_outputs() {
++        let mut wallet = Wallet::create_single(
++            "wpkh(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)",
++        )
++        .network(Network::Regtest)
++        .create_wallet_no_persist()
++        .unwrap();
++        let owned_script = wallet
++            .reveal_next_address(KeychainKind::External)
++            .script_pubkey();
++        let funding = Transaction {
++            version: transaction::Version::TWO,
++            lock_time: absolute::LockTime::ZERO,
++            input: vec![TxIn {
++                previous_output: OutPoint::new(Txid::from_byte_array([1; 32]), 0),
++                ..Default::default()
++            }],
++            output: vec![
++                TxOut {
++                    value: Amount::from_sat(12_000),
++                    script_pubkey: owned_script,
++                },
++                TxOut {
++                    value: Amount::from_sat(88_000),
++                    script_pubkey: ScriptBuf::new(),
++                },
++            ],
++        };
++        let funding_id = funding.compute_txid();
++        wallet.apply_unconfirmed_txs([(funding, 1)]);
++        let spend = Transaction {
++            version: transaction::Version::TWO,
++            lock_time: absolute::LockTime::ZERO,
++            input: vec![TxIn {
++                previous_output: OutPoint::new(funding_id, 0),
++                ..Default::default()
++            }],
++            output: vec![TxOut {
++                value: Amount::from_sat(8_000),
++                script_pubkey: ScriptBuf::new(),
++            }],
++        };
++        let spend_id = spend.compute_txid();
++        wallet.apply_unconfirmed_txs([(spend, 2)]);
++        let mut context =
++            AppContext::new_offline_wallet(Network::Regtest, PathBuf::new(), &mut wallet);
++        let result = TransactionsCommand.execute(&mut context).unwrap();
++        let received = result
++            .items
++            .iter()
++            .find(|item| item.txid == funding_id.to_string())
++            .unwrap();
++        assert_eq!(received.received, 12_000);
++        assert_eq!(received.sent, 0);
++        let sent = result
++            .items
++            .iter()
++            .find(|item| item.txid == spend_id.to_string())
++            .unwrap();
++        assert_eq!(sent.sent, 12_000);
++        assert_eq!(sent.received, 0);
++        assert_eq!(sent.fee, Some(4_000));
++        assert!(sent.chain_position.get("Unconfirmed").is_some());
++    }
++}
++
+ impl AppCommand<AppContext<OfflineOperations<'_>>> for BalanceCommand {
+     type Output = BalanceResult;
+ 
+diff --git a/src/handlers/online.rs b/src/handlers/online.rs
+index 15ac2ae..6a17c47 100644
+--- a/src/handlers/online.rs
++++ b/src/handlers/online.rs
+@@ -192,10 +192,9 @@ impl AsyncAppCommand<AppContext<OnlineOperations<'_>>> for FullScanCommand {
+ 
+                 let blockchain_info = client.get_blockchain_info()?;
+ 
+-                let genesis_block = bdk_wallet::bitcoin::constants::genesis_block(wallet.network());
+                 let genesis_cp = CheckPoint::new(BlockId {
+                     height: 0,
+-                    hash: genesis_block.block_hash(),
++                    hash: wallet.local_chain().genesis_hash(),
+                 });
+                 let mut emitter = Emitter::new(
+                     client.as_ref(),
+diff --git a/src/persister.rs b/src/persister.rs
+index 3ff8e61..5a954b8 100644
+--- a/src/persister.rs
++++ b/src/persister.rs
+@@ -89,8 +89,13 @@ where
+     };
+     wallet_load_params = wallet_load_params.extract_keys();
+ 
++    let genesis_hash = wallet_opts
++        .genesis_hash
++        .unwrap_or_else(|| bdk_wallet::bitcoin::constants::genesis_block(network).block_hash());
++
+     let wallet_opt = wallet_load_params
+         .check_network(network)
++        .check_genesis_hash(genesis_hash)
+         .load_wallet(persister)
+         .map_err(|e| Error::Generic(e.to_string()))?;
+ 
+@@ -107,6 +112,7 @@ where
+ 
+             builder
+                 .network(network)
++                .genesis_hash(genesis_hash)
+                 .create_wallet(persister)
+                 .map_err(|e| Error::Generic(e.to_string()))?
+         }
+@@ -115,6 +121,64 @@ where
+     Ok(wallet)
+ }
+ 
++#[cfg(all(test, feature = "sqlite", feature = "electrum"))]
++mod custom_genesis_tests {
++    use super::*;
++    use crate::config::WalletConfig;
++    use bdk_wallet::bitcoin::BlockHash;
++    use bdk_wallet::rusqlite::Connection;
++    use std::str::FromStr;
++
++    const TESTNET5_GENESIS: &str =
++        "00000000000008c1637e7d3252dc1c333d4546fd6fff6a474b200d674a91d497";
++
++    fn options() -> WalletOpts {
++        let config: WalletConfig = toml::from_str(&format!(
++            r#"
++            [wallets.testnet5]
++            network = "testnet4"
++            genesis_hash = "{TESTNET5_GENESIS}"
++            ext_descriptor = "tr(79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)"
++            database_type = "sqlite"
++            client_type = "electrum"
++            server_url = "tcp://127.0.0.1:50001"
++            "#
++        ))
++        .unwrap();
++        config.get_wallet_opts("testnet5").unwrap()
++    }
++
++    #[test]
++    fn custom_genesis_survives_reload_and_rejects_wrong_chain() {
++        let mut connection = Connection::open_in_memory().unwrap();
++        let mut opts = options();
++        let expected = BlockHash::from_str(TESTNET5_GENESIS).unwrap();
++        let wallet = new_persisted_wallet(Network::Testnet4, &mut connection, &opts).unwrap();
++        assert_eq!(wallet.local_chain().genesis_hash(), expected);
++        assert!(
++            wallet
++                .peek_address(KeychainKind::External, 0)
++                .to_string()
++                .starts_with("tb1p")
++        );
++        drop(wallet);
++        let reloaded = new_persisted_wallet(Network::Testnet4, &mut connection, &opts).unwrap();
++        assert_eq!(reloaded.local_chain().genesis_hash(), expected);
++        drop(reloaded);
++        opts.genesis_hash = None;
++        assert!(new_persisted_wallet(Network::Testnet4, &mut connection, &opts).is_err());
++    }
++
++    #[test]
++    fn non_persisted_wallet_uses_custom_genesis() {
++        let wallet = new_wallet(Network::Testnet4, &options()).unwrap();
++        assert_eq!(
++            wallet.local_chain().genesis_hash(),
++            BlockHash::from_str(TESTNET5_GENESIS).unwrap()
++        );
++    }
++}
++
+ #[cfg(feature = "redb")]
+ fn redb_wallet_data_exists(datadir: &std::path::Path, wallet_name: &str) -> Result<bool, Error> {
+     let db_path = datadir.join("wallet.redb");
+@@ -233,6 +297,12 @@ pub(crate) fn new_wallet(network: Network, wallet_opts: &WalletOpts) -> Result<W
+         Wallet::create_single(ext_descriptor)
+     };
+ 
+-    let wallet = builder.network(network).create_wallet_no_persist()?;
++    let genesis_hash = wallet_opts
++        .genesis_hash
++        .unwrap_or_else(|| bdk_wallet::bitcoin::constants::genesis_block(network).block_hash());
++    let wallet = builder
++        .network(network)
++        .genesis_hash(genesis_hash)
++        .create_wallet_no_persist()?;
+     Ok(wallet)
+ }
+diff --git a/src/utils/types.rs b/src/utils/types.rs
+index f6bd4cf..0ad9a7b 100644
+--- a/src/utils/types.rs
++++ b/src/utils/types.rs
+@@ -30,6 +30,10 @@ impl From<AddressInfo> for AddressResult {
+ #[derive(Serialize)]
+ pub struct TransactionDetails {
+     pub txid: String,
++    pub received: u64,
++    pub sent: u64,
++    pub fee: Option<u64>,
++    pub chain_position: serde_json::Value,
+     pub is_coinbase: bool,
+     pub wtxid: String,
+     pub version: serde_json::Value,

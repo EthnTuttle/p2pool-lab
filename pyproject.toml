@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "p2pool-lab"
+version = "0.1.0"
+description = "A local testnet5 P2Poolv2 lab with rbitcoin, BDK and a web dashboard"
+requires-python = ">=3.11"
+dependencies = ["pyzmq==27.1.0", "embit==0.8.0", "qrcode==8.2"]
+license = "MIT"
+
+[project.scripts]
+p2pool-lab = "p2pool_lab.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["p2pool_lab*"]
+
+[tool.setuptools.package-data]
+p2pool_lab = ["static/*", "templates/*"]

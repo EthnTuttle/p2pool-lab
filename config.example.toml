@@ -1,0 +1,32 @@
+# Public configuration only. The default state directory is outside this repo.
+[runtime]
+state_dir = "~/.local/share/p2pool-lab"
+log_scope = "user"
+
+[network]
+# Loopback by default. For LAN miners, use your host's LAN address for both.
+bind_host = "127.0.0.1"
+public_host = "127.0.0.1"
+dashboard_port = 8080
+stratum_port = 3333
+api_port = 46884
+share_peer_port = 56886
+bitcoin_rpc_port = 18352
+electrum_port = 50001
+esplora_port = 3002
+health_port = 9332
+zmq_port = 28335
+
+[bitcoin]
+peers = ["lapis.erisian.com.au:18353", "tn5.21m.dev:18353"]
+
+# These documentation addresses are examples: replace them before enabling.
+# [miners.office]
+# name = "Office Bitaxe"
+# url = "http://192.0.2.100"
+# worker = "office"
+#
+# [miners.spare]
+# name = "Second Bitaxe"
+# url = "http://192.0.2.110"
+# worker = "spare"

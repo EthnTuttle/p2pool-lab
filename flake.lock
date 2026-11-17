@@ -1,0 +1,81 @@
+{
+  "nodes": {
+    "bdk-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794839644,
+        "narHash": "sha256-nXrl5xJhfKhbDY9oDVbceLUAaXiG8054lGYt3ojkzeM=",
+        "owner": "bitcoindevkit",
+        "repo": "bdk-cli",
+        "rev": "2fceebafc4b10f44f268dcbbdf840193023cf4bb",
+        "type": "github"
+      },
+      "original": {
+        "owner": "bitcoindevkit",
+        "repo": "bdk-cli",
+        "rev": "2fceebafc4b10f44f268dcbbdf840193023cf4bb",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1793183032,
+        "narHash": "sha256-56mFMf8heLNfYhcgbrh4GpN5x+G9JOfTFXZC3n6w0qM=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "08d3a97586f6b6343b3b5e799980773629432610",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "08d3a97586f6b6343b3b5e799980773629432610",
+        "type": "github"
+      }
+    },
+    "p2pool-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794639279,
+        "narHash": "sha256-DvSPlAhXKrBznITYGU4AsJDA7CbDQXyo++SwTh4Vw1c=",
+        "owner": "p2poolv2",
+        "repo": "p2poolv2",
+        "rev": "18adc94a1907b23de2b20e94485213106c6b7754",
+        "type": "github"
+      },
+      "original": {
+        "owner": "p2poolv2",
+        "repo": "p2poolv2",
+        "rev": "18adc94a1907b23de2b20e94485213106c6b7754",
+        "type": "github"
+      }
+    },
+    "rbitcoin-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794798532,
+        "narHash": "sha256-DLRULVrO4GZVSrFU+vL2bjqbsvGYbZkrpkpE2LB+n18=",
+        "owner": "rbitcoin-org",
+        "repo": "rbitcoin",
+        "rev": "28f3c89bf0e4cbc5c6f211856c14d5c6d7a6fbe4",
+        "type": "github"
+      },
+      "original": {
+        "owner": "rbitcoin-org",
+        "repo": "rbitcoin",
+        "rev": "28f3c89bf0e4cbc5c6f211856c14d5c6d7a6fbe4",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "bdk-src": "bdk-src",
+        "nixpkgs": "nixpkgs",
+        "p2pool-src": "p2pool-src",
+        "rbitcoin-src": "rbitcoin-src"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

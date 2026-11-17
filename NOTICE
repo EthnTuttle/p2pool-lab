@@ -1,0 +1,17 @@
+P2Pool Lab is an independent integration project.
+
+Upstream components, fetched at revisions recorded in flake.lock:
+
+- rbitcoin: https://github.com/rbitcoin-org/rbitcoin
+  MIT OR Apache-2.0.
+- P2Poolv2: https://github.com/p2poolv2/p2poolv2
+  MIT OR Apache-2.0.
+- Bitcoin Dev Kit CLI: https://github.com/bitcoindevkit/bdk-cli
+  Upstream license files retained in the fetched source. The local patch modifies
+  BDK CLI's existing code under its upstream licensing terms. Copies of those
+  license files accompany the patch under patches/licenses/.
+- embit: https://github.com/diybitcoinhardware/embit (MIT).
+- python-qrcode and pyzmq retain their upstream licenses.
+
+The dashboard, orchestration, configuration, and packaging in this repository are
+licensed under LICENSE. No endorsement by these upstream projects is implied.
