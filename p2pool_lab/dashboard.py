@@ -296,6 +296,9 @@ class Monitor:
         self.database = database
         self.lock = threading.Lock()
         self.action_lock = threading.Lock()
+        self.owner_history_lock = threading.Lock()
+        self.owner_history_tip = None
+        self.owner_history_heights = []
         self.token = secrets.token_urlsafe(32)
         self.settings = json.loads((ROOT / "miner-settings.json").read_text())
         self.state = {"updated_at": None, "sources": {}, "alerts": []}
@@ -395,6 +398,42 @@ class Monitor:
                 "A different or duplicate miner answered at this address; update the device inventory"
             )
         return data
+
+    def owner_share_pages(self):
+        owner = self.settings["share_owner_address"]
+        shares_url = f"{POOL}/shares"
+        with self.owner_history_lock:
+            tip = request(f"{shares_url}?num=1")["shares"][0]
+            start = 0
+            heights = []
+            if self.owner_history_tip:
+                previous = self.owner_history_tip
+                if previous["height"] <= tip["height"]:
+                    checkpoint = request(f'{shares_url}?num=1&to={previous["height"]}')
+                    if checkpoint["shares"][0]["blockhash"] == previous["blockhash"]:
+                        start = previous["height"] + 1
+                        heights = self.owner_history_heights.copy()
+
+            end = tip["height"]
+            while end >= start:
+                count = min(SHARE_BATCH_SIZE, end - start + 1)
+                batch = request(f"{shares_url}?num={count}&to={end}")
+                if batch["to_height"] != end or len(batch["shares"]) != count:
+                    raise RuntimeError("Share history changed while loading")
+                for share in batch["shares"]:
+                    if any(entry["miner_address"] == owner for entry in [share, *share["uncles"]]):
+                        heights.append(share["height"])
+                end = batch["from_height"] - 1
+
+            checkpoint = request(f'{shares_url}?num=1&to={tip["height"]}')
+            if checkpoint["shares"][0]["blockhash"] != tip["blockhash"]:
+                raise RuntimeError("Share history changed while loading")
+            self.owner_history_tip = tip
+            self.owner_history_heights = heights
+
+        page_size = SHARE_BATCH_SIZE * SHARE_PAGE_BATCHES
+        pages = {(tip["height"] - height) // page_size for height in heights}
+        return [tip["height"] - page * page_size for page in sorted(pages)]
 
     def owner_shares(self, to_height):
         owner = self.settings["share_owner_address"]
@@ -756,6 +795,8 @@ class Handler(BaseHTTPRequestHandler):
                 ):
                     return self.reply({"error": "Invalid share height"}, 400)
                 return self.reply(self.server.monitor.owner_shares(to_height))
+            if path.path == "/api/owner-share-pages":
+                return self.reply(self.server.monitor.owner_share_pages())
             if path.path == "/api/wallet/qr":
                 address = parse_qs(path.query).get("address", [""])[0]
                 return self.reply(

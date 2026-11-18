@@ -192,6 +192,45 @@ class DashboardTests(unittest.TestCase):
             [share["estimated_block_sats"] for share in page["shares"]], [1000, 900]
         )
 
+    def test_owner_page_index_skips_empty_ranges_and_rebuilds_after_reorg(self):
+        from urllib.parse import parse_qs, urlsplit
+
+        owner = self.monitor.settings["share_owner_address"]
+        tip = 1500
+        owned = {25, 1460}
+        revision = 0
+
+        def fetch(url):
+            query = parse_qs(urlsplit(url).query)
+            end = min(tip, int(query.get("to", [tip])[0]))
+            start = max(0, end - int(query["num"][0]) + 1)
+            return {
+                "from_height": start,
+                "to_height": end,
+                "shares": [
+                    {
+                        "height": height,
+                        "blockhash": f"{revision}-{height}",
+                        "miner_address": "other",
+                        "uncles": [{"miner_address": owner}] if height in owned else [],
+                    }
+                    for height in range(end, start - 1, -1)
+                ],
+            }
+
+        with patch.object(server, "request", side_effect=fetch) as request:
+            self.assertEqual(self.monitor.owner_share_pages(), [1500, 500])
+            request.reset_mock()
+            tip = 1501
+            self.assertEqual(self.monitor.owner_share_pages(), [1501, 501])
+            self.assertEqual(request.call_count, 4)
+            revision = 1
+            owned = {990}
+            self.assertEqual(self.monitor.owner_share_pages(), [1001])
+            revision = 2
+            owned = set()
+            self.assertEqual(self.monitor.owner_share_pages(), [])
+
     def test_share_payout_window_and_recent_pace(self):
         self.assertEqual(server.payout_window(33_037), (39_085, 160_044))
         self.assertEqual(server.payout_window(6_047), (6_048, 133_054))

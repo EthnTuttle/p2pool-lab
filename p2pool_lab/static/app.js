@@ -10,9 +10,9 @@ let metric = "hashrate";
 let actionPending = false;
 let historyRequest = 0;
 let selectedMiner = new URLSearchParams(location.search).get("miner") || "fleet";
-let sharePage = null;
+let shareHistoryLoaded = false;
 let sharePageNumber = 1;
-let sharePageAnchor = null;
+let sharePageRanges = [];
 let loadingSharePage = false;
 
 function text(id, value) { byId(id).textContent = value; }
@@ -288,7 +288,11 @@ function sharePayoutCell(share, page) {
 }
 function renderSharePagination() {
   const pagination = byId("share-pagination");
-  const total = sharePage ? Math.ceil((sharePageAnchor + 1) / sharePage.page_size) : 1;
+  const total = sharePageRanges.length;
+  if (shareHistoryLoaded && !total) {
+    pagination.replaceChildren();
+    return;
+  }
   const button = (label, target, disabled = false) => {
     const node = element("button", label);
     node.type = "button";
@@ -296,6 +300,10 @@ function renderSharePagination() {
     node.addEventListener("click", () => loadSharePage(target));
     return node;
   };
+  if (!total) {
+    pagination.replaceChildren(button("Retry", 1));
+    return;
+  }
   const controls = [button("Previous", sharePageNumber - 1, sharePageNumber === 1)];
   const pages = [...new Set([1, sharePageNumber - 1, sharePageNumber, sharePageNumber + 1, total])]
     .filter(page => page >= 1 && page <= total).sort((a, b) => a - b);
@@ -307,7 +315,7 @@ function renderSharePagination() {
     }
     const node = button(number(page), page);
     node.setAttribute("aria-label", `Page ${page}`);
-    if (page === sharePageNumber && sharePage) node.setAttribute("aria-current", "page");
+    if (page === sharePageNumber && shareHistoryLoaded) node.setAttribute("aria-current", "page");
     controls.push(node);
   }
   controls.push(button("Next", sharePageNumber + 1, sharePageNumber === total));
@@ -320,11 +328,17 @@ async function loadSharePage(pageNumber = 1) {
   const pagination = byId("share-pagination");
   const restoreFocus = pagination.contains(document.activeElement);
   pagination.setAttribute("aria-busy", "true");
-  const to = pageNumber === 1 ? null : sharePageAnchor - (pageNumber - 1) * sharePage.page_size;
   try {
-    const query = to === null ? "" : "?to=" + to;
-    const page = await jsonRequest("/api/owner-shares" + query);
-    const rows = page.shares.map(share => {
+    let ranges = pageNumber === 1 ? await jsonRequest("/api/owner-share-pages") : sharePageRanges;
+    let page = ranges.length ? await jsonRequest("/api/owner-shares?to=" + ranges[pageNumber - 1]) : null;
+    if (page && !page.shares.length) {
+      // A reorg can empty a range after the index was read.
+      ranges = await jsonRequest("/api/owner-share-pages");
+      pageNumber = 1;
+      page = ranges.length ? await jsonRequest("/api/owner-shares?to=" + ranges[0]) : null;
+      if (page && !page.shares.length) throw new Error("Share history changed while loading");
+    }
+    const rows = (page?.shares ?? []).map(share => {
       const row = element("tr");
       const date = new Date(share.timestamp * 1000);
       const time = element("time", date.toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"}));
@@ -354,24 +368,24 @@ async function loadSharePage(pageNumber = 1) {
     });
     if (!rows.length) {
       const row = element("tr");
-      const cell = element("td", "No shares for this owner in this range.", "empty");
+      const cell = element("td", "No confirmed shares or referenced uncles for this owner yet.", "empty");
       cell.colSpan = 6;
       row.append(cell);
       rows.push(row);
     }
     byId("share-rows").replaceChildren(...rows);
     if (pageNumber !== sharePageNumber) byId("share-table").scrollTop = 0;
-    sharePage = page;
+    shareHistoryLoaded = true;
     sharePageNumber = pageNumber;
-    if (pageNumber === 1) sharePageAnchor = page.to_height;
-    text("share-page-status", `${number(page.shares.length)} in share heights ${number(page.from_height)}–${number(page.to_height)}`);
+    sharePageRanges = ranges;
+    text("share-page-status", page ? `${number(page.shares.length)} in share heights ${number(page.from_height)}–${number(page.to_height)}` : "0 shares");
   } catch (error) {
-    text("share-page-status", sharePage ? "Could not reload shares. Showing the last loaded range." : "Could not load shares. Select page 1 to retry.");
+    text("share-page-status", shareHistoryLoaded ? "Could not reload shares. Showing the last loaded range." : "Could not load shares. Select Retry to try again.");
   } finally {
     loadingSharePage = false;
     renderSharePagination();
     pagination.removeAttribute("aria-busy");
-    if (restoreFocus) (pagination.querySelector('[aria-current="page"]') || pagination.querySelector('[aria-label="Page 1"]'))?.focus();
+    if (restoreFocus) (pagination.querySelector('[aria-current="page"]') || pagination.querySelector("button"))?.focus();
   }
 }
 async function refreshHistory() {
