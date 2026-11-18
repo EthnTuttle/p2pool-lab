@@ -455,6 +455,7 @@ class Monitor:
             "from_height": oldest_height,
             "to_height": newest_height,
             "tip_height": latest["to_height"],
+            "page_size": SHARE_BATCH_SIZE * SHARE_PAGE_BATCHES,
             "estimate_time": now,
             "seconds_per_share": recent_share_interval(latest["shares"], now),
             "shares": sorted(

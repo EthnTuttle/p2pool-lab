@@ -71,12 +71,12 @@
     <section class="panel blocks-panel" id="owner-shares">
       <div class="panel-heading">
         <div><h2>Your shares</h2><p class="muted" id="share-page-status" role="status">Loading shares…</p></div>
-        <div class="share-page-buttons"><button id="share-latest" disabled>Latest</button><button id="share-older" disabled>Older</button></div>
       </div>
       <div class="table-wrap share-table" id="share-table" tabindex="0" role="region" aria-label="Shares belonging to this lab"><table>
         <thead><tr><th>Share height</th><th class="share-found">Found</th><th class="share-type">Type</th><th>Payout window</th><th class="share-value">Est. test sats / block</th><th>Share hash</th></tr></thead>
         <tbody id="share-rows"><tr><td colspan="6" class="empty">Waiting for the sharechain</td></tr></tbody>
       </table></div>
+      <nav id="share-pagination" class="share-page-buttons" aria-label="Share history pages"></nav>
       <p class="footnote">Includes shares and referenced uncles credited to this lab’s shared owner address. Payout windows use the confirmed sharechain tip, and dates use the latest 100 shares’ pace. Payment depends on the pool finding a Bitcoin block while the share is eligible for that block.</p>
       <p class="footnote">Estimated test sats use the current block reward and average sharechain work for one eligible pool block. Uncle estimates use the referencing share’s difficulty. Your share-owner keys stay on this lab. <a class="text-link" href="https://docs.p2poolv2.org/payouts/marketplace.html" target="_blank" rel="noopener noreferrer">How share trading works ↗</a></p>
     </section>

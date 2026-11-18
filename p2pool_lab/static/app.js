@@ -11,7 +11,9 @@ let actionPending = false;
 let historyRequest = 0;
 let selectedMiner = new URLSearchParams(location.search).get("miner") || "fleet";
 let sharePage = null;
-let sharePageEnd = null;
+let sharePageNumber = 1;
+let sharePageAnchor = null;
+let loadingSharePage = false;
 
 function text(id, value) { byId(id).textContent = value; }
 function element(tag, content, className) {
@@ -284,10 +286,41 @@ function sharePayoutCell(share, page) {
   }
   return cell;
 }
-async function loadSharePage(to = null) {
-  const latest = byId("share-latest");
-  const older = byId("share-older");
-  latest.disabled = older.disabled = true;
+function renderSharePagination() {
+  const pagination = byId("share-pagination");
+  const total = sharePage ? Math.ceil((sharePageAnchor + 1) / sharePage.page_size) : 1;
+  const button = (label, target, disabled = false) => {
+    const node = element("button", label);
+    node.type = "button";
+    node.disabled = disabled;
+    node.addEventListener("click", () => loadSharePage(target));
+    return node;
+  };
+  const controls = [button("Previous", sharePageNumber - 1, sharePageNumber === 1)];
+  const pages = [...new Set([1, sharePageNumber - 1, sharePageNumber, sharePageNumber + 1, total])]
+    .filter(page => page >= 1 && page <= total).sort((a, b) => a - b);
+  for (const [index, page] of pages.entries()) {
+    if (index && page > pages[index - 1] + 1) {
+      const gap = element("span", "…", "muted");
+      gap.setAttribute("aria-hidden", "true");
+      controls.push(gap);
+    }
+    const node = button(number(page), page);
+    node.setAttribute("aria-label", `Page ${page}`);
+    if (page === sharePageNumber && sharePage) node.setAttribute("aria-current", "page");
+    controls.push(node);
+  }
+  controls.push(button("Next", sharePageNumber + 1, sharePageNumber === total));
+  pagination.replaceChildren(...controls);
+}
+
+async function loadSharePage(pageNumber = 1) {
+  if (loadingSharePage) return;
+  loadingSharePage = true;
+  const pagination = byId("share-pagination");
+  const restoreFocus = pagination.contains(document.activeElement);
+  pagination.setAttribute("aria-busy", "true");
+  const to = pageNumber === 1 ? null : sharePageAnchor - (pageNumber - 1) * sharePage.page_size;
   try {
     const query = to === null ? "" : "?to=" + to;
     const page = await jsonRequest("/api/owner-shares" + query);
@@ -327,15 +360,18 @@ async function loadSharePage(to = null) {
       rows.push(row);
     }
     byId("share-rows").replaceChildren(...rows);
-    if (to !== sharePageEnd) byId("share-table").scrollTop = 0;
+    if (pageNumber !== sharePageNumber) byId("share-table").scrollTop = 0;
     sharePage = page;
-    sharePageEnd = to;
+    sharePageNumber = pageNumber;
+    if (pageNumber === 1) sharePageAnchor = page.to_height;
     text("share-page-status", `${number(page.shares.length)} in share heights ${number(page.from_height)}–${number(page.to_height)}`);
   } catch (error) {
-    text("share-page-status", sharePage ? "Could not reload shares. Showing the last loaded range." : "Could not load shares. Select Latest to retry.");
+    text("share-page-status", sharePage ? "Could not reload shares. Showing the last loaded range." : "Could not load shares. Select page 1 to retry.");
   } finally {
-    latest.disabled = false;
-    older.disabled = !(sharePage?.from_height > 0);
+    loadingSharePage = false;
+    renderSharePagination();
+    pagination.removeAttribute("aria-busy");
+    if (restoreFocus) (pagination.querySelector('[aria-current="page"]') || pagination.querySelector('[aria-label="Page 1"]'))?.focus();
   }
 }
 async function refreshHistory() {
@@ -403,13 +439,11 @@ document.querySelectorAll("[data-copy]").forEach(button => button.addEventListen
   setTimeout(() => button.textContent = "Copy", 2000);
 }));
 byId("history-range").addEventListener("change", refreshHistory);
-byId("share-latest").addEventListener("click", () => loadSharePage());
-byId("share-older").addEventListener("click", () => loadSharePage(sharePage.from_height - 1));
 setInterval(() => {
   const table = byId("share-table");
-  if (state && !byId("share-latest").disabled &&
+  if (state && !loadingSharePage &&
       !document.hidden && !table.scrollTop && !byId("owner-shares").contains(document.activeElement)) {
-    loadSharePage(sharePageEnd);
+    loadSharePage(sharePageNumber);
   }
 }, 30000);
 byId("load-logs").addEventListener("click", async () => {

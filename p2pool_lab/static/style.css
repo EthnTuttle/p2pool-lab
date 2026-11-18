@@ -26,7 +26,15 @@
 
 .share-page-buttons {
   display: flex;
-  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 14px;
+}
+
+.share-page-buttons [aria-current="page"] {
+  color: var(--orange);
+  border-color: var(--orange);
 }
 
 .share-table {
