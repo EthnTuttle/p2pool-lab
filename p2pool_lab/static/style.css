@@ -11,3 +11,81 @@
 .stat-grid{grid-template-columns:repeat(5,minmax(0,1fr))}.device-grid{grid-template-columns:repeat(auto-fit,minmax(250px,1fr))}.devices-panel{margin-bottom:20px}.device-forms{display:grid;grid-template-columns:1fr 1fr;gap:20px}.device-forms label{display:block;font-size:11px;color:var(--muted);margin-bottom:8px}.inline-form{display:flex;gap:8px}.inline-form input{min-width:0;flex:1;padding:10px;border:1px solid #3b4350;border-radius:7px;background:#10151b;color:var(--text);font:12px ui-monospace,monospace}.devices-panel .table-wrap{margin-top:20px}.discovered-device{display:flex;justify-content:space-between;align-items:center;gap:12px;border:1px solid var(--line);border-radius:7px;padding:12px;margin:8px 0;font-size:12px}.device-actions{display:flex;gap:7px}.stat .stat-value{font-size:28px}
 @media(max-width:1100px){.stat-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:740px){.stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.device-forms{grid-template-columns:1fr}.stat .stat-value{font-size:24px}.device-grid{grid-template-columns:1fr}}
+
+.share-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+}
+
+#share-page-status {
+  margin-top: 5px;
+  font-size: 11px;
+}
+
+.share-page-buttons {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 14px;
+}
+
+.share-page-buttons [aria-current="page"] {
+  color: var(--orange);
+  border-color: var(--orange);
+}
+
+.share-table {
+  max-height: 295px;
+}
+
+.share-table th {
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+}
+
+.share-table a:hover {
+  text-decoration: underline;
+}
+
+.share-table small {
+  display: block;
+  color: var(--muted);
+}
+
+.share-table .share-type-mobile {
+  display: none;
+}
+
+.share-table th.share-value {
+  white-space: normal;
+}
+
+.block-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 32px;
+  margin: 0 0 20px;
+}
+
+.block-counts dd {
+  color: var(--text);
+  font-size: 26px;
+  text-align: left;
+}
+
+@media (max-width: 500px) {
+  .share-table .share-found,
+  .share-table .share-type,
+  .share-table th:last-child,
+  .share-table td:not([colspan]):last-child {
+    display: none;
+  }
+
+  .share-table .share-type-mobile {
+    display: block;
+  }
+}

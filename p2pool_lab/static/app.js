@@ -10,6 +10,10 @@ let metric = "hashrate";
 let actionPending = false;
 let historyRequest = 0;
 let selectedMiner = new URLSearchParams(location.search).get("miner") || "fleet";
+let shareHistoryLoaded = false;
+let sharePageNumber = 1;
+let sharePageRanges = [];
+let loadingSharePage = false;
 
 function text(id, value) { byId(id).textContent = value; }
 function element(tag, content, className) {
@@ -180,7 +184,8 @@ function render() {
   badge("wallet-badge", source("wallet") ? "Synced " + clock(state.sources.wallet.updated_at).slice(0, 5) : "Unavailable", source("wallet") ? "" : "warning");
   text("payout-address", state.settings.bitcoin_payout_address);
   text("share-address", state.settings.share_owner_address);
-  text("blocks-count", `${number(values.bitcoin_blocks_found_total)} recorded pool blocks`);
+  text("lab-blocks-count", number(metrics.lab_blocks_found));
+  text("blocks-count", number(values.bitcoin_blocks_found_total));
   const rows = (metrics.blocks || []).map(block => {
     const row = element("tr");
     const date = new Date(block.timestamp * 1000).toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"});
@@ -259,6 +264,130 @@ async function jsonRequest(url, options = {}) {
   }
   return data;
 }
+function sharePayoutCell(share, page) {
+  const cell = element("td");
+  const nextHeight = page.tip_height + 1;
+  const blocksToGo = share.payout_from_height - nextHeight;
+  if (nextHeight > share.payout_through_height) {
+    cell.append(element("span", "Window ended"), element("small", `After ${number(share.payout_through_height)}`));
+  } else if (blocksToGo <= 0) {
+    cell.append(element("span", "In window"), element("small", `Through ${number(share.payout_through_height)}`));
+  } else {
+    const when = element("span", "Waiting");
+    if (page.seconds_per_share) {
+      const hours = (page.estimate_time + blocksToGo * page.seconds_per_share) / 3600;
+      const date = new Date(Math.round(hours) * 3600000);
+      const label = date.toLocaleString([], {month: "short", day: "numeric", hour: "numeric"});
+      const time = element("time", label);
+      time.dateTime = date.toISOString();
+      when.replaceChildren("Est. ", time);
+    }
+    cell.append(when, element("small", `From ${number(share.payout_from_height)}`));
+  }
+  return cell;
+}
+function renderSharePagination() {
+  const pagination = byId("share-pagination");
+  const total = sharePageRanges.length;
+  if (shareHistoryLoaded && !total) {
+    pagination.replaceChildren();
+    return;
+  }
+  const button = (label, target, disabled = false) => {
+    const node = element("button", label);
+    node.type = "button";
+    node.disabled = disabled;
+    node.addEventListener("click", () => loadSharePage(target));
+    return node;
+  };
+  if (!total) {
+    pagination.replaceChildren(button("Retry", 1));
+    return;
+  }
+  const controls = [button("Previous", sharePageNumber - 1, sharePageNumber === 1)];
+  const pages = [...new Set([1, sharePageNumber - 1, sharePageNumber, sharePageNumber + 1, total])]
+    .filter(page => page >= 1 && page <= total).sort((a, b) => a - b);
+  for (const [index, page] of pages.entries()) {
+    if (index && page > pages[index - 1] + 1) {
+      const gap = element("span", "…", "muted");
+      gap.setAttribute("aria-hidden", "true");
+      controls.push(gap);
+    }
+    const node = button(number(page), page);
+    node.setAttribute("aria-label", `Page ${page}`);
+    if (page === sharePageNumber && shareHistoryLoaded) node.setAttribute("aria-current", "page");
+    controls.push(node);
+  }
+  controls.push(button("Next", sharePageNumber + 1, sharePageNumber === total));
+  pagination.replaceChildren(...controls);
+}
+
+async function loadSharePage(pageNumber = 1) {
+  if (loadingSharePage) return;
+  loadingSharePage = true;
+  const pagination = byId("share-pagination");
+  const restoreFocus = pagination.contains(document.activeElement);
+  pagination.setAttribute("aria-busy", "true");
+  try {
+    let ranges = pageNumber === 1 ? await jsonRequest("/api/owner-share-pages") : sharePageRanges;
+    let page = ranges.length ? await jsonRequest("/api/owner-shares?to=" + ranges[pageNumber - 1]) : null;
+    if (page && !page.shares.length) {
+      // A reorg can empty a range after the index was read.
+      ranges = await jsonRequest("/api/owner-share-pages");
+      pageNumber = 1;
+      page = ranges.length ? await jsonRequest("/api/owner-shares?to=" + ranges[0]) : null;
+      if (page && !page.shares.length) throw new Error("Share history changed while loading");
+    }
+    const rows = (page?.shares ?? []).map(share => {
+      const row = element("tr");
+      const date = new Date(share.timestamp * 1000);
+      const time = element("time", date.toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"}));
+      time.dateTime = date.toISOString();
+      const found = element("td", undefined, "share-found");
+      found.append(time);
+      const height = element("td");
+      const link = element("a", share.height === null ? "View share" : number(share.height), "text-link");
+      link.title = share.blockhash;
+      link.href = new URL("/share?hash=" + encodeURIComponent(share.blockhash), state.settings.explorer_url);
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      height.append(link, element("small", share.kind, "share-type-mobile"));
+      const hash = element("td", short(share.blockhash, 14));
+      hash.title = share.blockhash;
+      const sats = share.estimated_block_sats;
+      const amount = sats === null ? "—" : sats === 0 ? "<1" : "≈ " + number(sats);
+      row.append(
+        height,
+        found,
+        element("td", share.kind, "share-type"),
+        sharePayoutCell(share, page),
+        element("td", amount, "share-value"),
+        hash,
+      );
+      return row;
+    });
+    if (!rows.length) {
+      const row = element("tr");
+      const cell = element("td", "No confirmed shares or referenced uncles for this owner yet.", "empty");
+      cell.colSpan = 6;
+      row.append(cell);
+      rows.push(row);
+    }
+    byId("share-rows").replaceChildren(...rows);
+    if (pageNumber !== sharePageNumber) byId("share-table").scrollTop = 0;
+    shareHistoryLoaded = true;
+    sharePageNumber = pageNumber;
+    sharePageRanges = ranges;
+    text("share-page-status", page ? `${number(page.shares.length)} in share heights ${number(page.from_height)}–${number(page.to_height)}` : "0 shares");
+  } catch (error) {
+    text("share-page-status", shareHistoryLoaded ? "Could not reload shares. Showing the last loaded range." : "Could not load shares. Select Retry to try again.");
+  } finally {
+    loadingSharePage = false;
+    renderSharePagination();
+    pagination.removeAttribute("aria-busy");
+    if (restoreFocus) (pagination.querySelector('[aria-current="page"]') || pagination.querySelector("button"))?.focus();
+  }
+}
 async function refreshHistory() {
   if (!selectedMiner) { byId("chart").replaceChildren(element("p", "Configure a miner to begin collecting history.")); return; }
   const request = ++historyRequest;
@@ -270,7 +399,12 @@ async function refreshHistory() {
   } catch (error) { text("history-note", "History unavailable: " + error.message); }
 }
 async function refresh() {
-  try { state = await jsonRequest("/api/state"); render(); }
+  try {
+    const firstLoad = !state;
+    state = await jsonRequest("/api/state");
+    render();
+    if (firstLoad) loadSharePage();
+  }
   catch (error) {
     text("last-update", "Dashboard unavailable · readings may be stale");
     byId("live-dot").classList.add("offline");
@@ -319,6 +453,13 @@ document.querySelectorAll("[data-copy]").forEach(button => button.addEventListen
   setTimeout(() => button.textContent = "Copy", 2000);
 }));
 byId("history-range").addEventListener("change", refreshHistory);
+setInterval(() => {
+  const table = byId("share-table");
+  if (state && !loadingSharePage &&
+      !document.hidden && !table.scrollTop && !byId("owner-shares").contains(document.activeElement)) {
+    loadSharePage(sharePageNumber);
+  }
+}, 30000);
 byId("load-logs").addEventListener("click", async () => {
   byId("logs").hidden = false; text("logs", "Loading service logs…");
   try { const result = await jsonRequest("/api/logs?source=" + byId("log-source").value); text("logs", result.text || "No log entries."); }

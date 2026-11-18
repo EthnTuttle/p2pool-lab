@@ -137,6 +137,140 @@ class DashboardTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "did not save"):
                 self.monitor.action("100", "configure-pool")
 
+    def test_owner_shares_matches_share_address_and_includes_referenced_uncles(self):
+        def entry(height, blockhash, owner="tp2pool1-test"):
+            return {
+                "height": height,
+                "blockhash": blockhash,
+                "miner_address": owner,
+                "miner_bitcoin_address": "tb1q-test-payout",
+                "timestamp": 1000 + height,
+                "bits": 0x207FFFFF,
+            }
+
+        uncle = entry(99, "uncle")
+        batches = [
+            {
+                "from_height": 7001,
+                "to_height": 7100,
+                "shares": [entry(7100, "tip"), entry(7001, "previous")],
+            },
+            {"chain_tip_height": 7100, "total_work": hex(7101 * 2)},
+            {
+                "from_height": 100,
+                "to_height": 199,
+                "shares": [
+                    dict(entry(150, "confirmed"), uncles=[]),
+                    dict(entry(110, "other", "tp2pool1-other"), uncles=[uncle]),
+                    dict(entry(105, "other2", "tp2pool1-other"), uncles=[uncle]),
+                ],
+            },
+            {"from_height": 0, "to_height": 99, "shares": []},
+        ]
+        with (
+            patch.object(server, "request", side_effect=batches) as request,
+            patch.object(server.time, "time", return_value=8101),
+            patch.object(server, "bitcoin_rpc", return_value={"coinbasevalue": 6048000}),
+        ):
+            page = self.monitor.owner_shares(199)
+
+        self.assertEqual((page["from_height"], page["to_height"]), (0, 199))
+        self.assertEqual(page["tip_height"], 7100)
+        self.assertEqual(page["seconds_per_share"], 1)
+        self.assertEqual(
+            [(share["blockhash"], share["kind"]) for share in page["shares"]],
+            [("confirmed", "Confirmed"), ("uncle", "Uncle")],
+        )
+        self.assertEqual(
+            [call.args[0].rsplit("/", 1)[1] for call in request.call_args_list],
+            ["shares?num=100", "chain_info", "shares?num=100&to=199", "shares?num=100&to=99"],
+        )
+        self.assertEqual(
+            [share["payout_from_height"] for share in page["shares"]], [151, 106]
+        )
+        self.assertEqual(
+            [share["estimated_block_sats"] for share in page["shares"]], [1000, 900]
+        )
+
+    def test_owner_page_index_skips_empty_ranges_and_rebuilds_after_reorg(self):
+        from urllib.parse import parse_qs, urlsplit
+
+        owner = self.monitor.settings["share_owner_address"]
+        tip = 1500
+        owned = {25, 1460}
+        revision = 0
+
+        def fetch(url):
+            query = parse_qs(urlsplit(url).query)
+            end = min(tip, int(query.get("to", [tip])[0]))
+            start = max(0, end - int(query["num"][0]) + 1)
+            return {
+                "from_height": start,
+                "to_height": end,
+                "shares": [
+                    {
+                        "height": height,
+                        "blockhash": f"{revision}-{height}",
+                        "miner_address": "other",
+                        "uncles": [{"miner_address": owner}] if height in owned else [],
+                    }
+                    for height in range(end, start - 1, -1)
+                ],
+            }
+
+        with patch.object(server, "request", side_effect=fetch) as request:
+            self.assertEqual(self.monitor.owner_share_pages(), [1500, 500])
+            request.reset_mock()
+            tip = 1501
+            self.assertEqual(self.monitor.owner_share_pages(), [1501, 501])
+            self.assertEqual(request.call_count, 4)
+            revision = 1
+            owned = {990}
+            self.assertEqual(self.monitor.owner_share_pages(), [1001])
+            revision = 2
+            owned = set()
+            self.assertEqual(self.monitor.owner_share_pages(), [])
+
+    def test_share_payout_window_and_recent_pace(self):
+        self.assertEqual(server.payout_window(33_037), (39_085, 160_044))
+        self.assertEqual(server.payout_window(6_047), (6_048, 133_054))
+        self.assertEqual(server.payout_window(6_048), (12_096, 133_055))
+        recent = [
+            {"height": 105, "timestamp": 150},
+            {"height": 100, "timestamp": 100},
+        ]
+        self.assertEqual(server.recent_share_interval(recent, 151), 10)
+        self.assertIsNone(server.recent_share_interval(recent, 1100))
+        self.assertIsNone(server.recent_share_interval(recent[:1], 151))
+
+    def test_share_value_uses_work_discount_and_payout_window_size(self):
+        estimate = server.estimate_share_sats
+        partial = (8_953_000, 30_000, 14_999, 15_000, 0x207FFFFF)
+        self.assertEqual(estimate(*partial, 10), 1000)
+        self.assertEqual(estimate(*partial, 9), 900)
+        self.assertEqual(estimate(*partial, 11), 1100)
+        self.assertEqual(estimate(120_960_000, 500_000, 249_999, 250_000, 0x207FFFFF, 10), 1000)
+        self.assertIsNone(estimate(120_960_000, 500_000, 249_999, 250_000, 0, 10))
+
+    def test_lab_block_count_includes_finds_older_than_the_recent_table(self):
+        payout = self.monitor.settings["bitcoin_payout_address"]
+        lines = ["bitcoin_blocks_found_total 10"]
+        for height in range(10):
+            miner = payout if height in (0, 9) else "tb1q-other"
+            lines.append(
+                f'bitcoin_block_found_time_seconds{{blockhash="{height:064x}",'
+                f'height="{height}",miner="{miner}",network="testnet5"}} {height + 100}'
+            )
+        metrics = server.parse_metrics("\n".join(lines), payout)
+        self.assertEqual(metrics["values"]["bitcoin_blocks_found_total"], 10)
+        self.assertEqual(metrics["lab_blocks_found"], 2)
+        self.assertEqual(len(metrics["blocks"]), 8)
+        self.assertEqual(metrics["blocks"][0]["height"], "9")
+        incomplete = server.parse_metrics("\n".join(lines[:-1]), payout)
+        empty = server.parse_metrics("bitcoin_blocks_found_total 0", payout)
+        self.assertIsNone(incomplete["lab_blocks_found"])
+        self.assertEqual(empty["lab_blocks_found"], 0)
+
     def test_failed_miner_poll_records_gap_and_retains_last_good_timestamp(self):
         def fetch(url, **kwargs):
             if url.endswith("chain_info"):
