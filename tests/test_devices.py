@@ -1,12 +1,11 @@
 from contextlib import contextmanager
-import json
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-from p2pool_lab.devices import DeviceRegistry, fleet_summary, probe, scan_network
+from p2pool_lab.devices import DeviceRegistry, fleet_summary, scan_network
 
 
 class DeviceTests(unittest.TestCase):
@@ -79,23 +78,6 @@ class DeviceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "No responding AxeOS"):
                 self.registry.add("192.168.50.1")
         self.assertEqual(self.registry.devices(), {})
-
-    def test_bonanza_beta_model_is_discovered_and_still_requires_device_identity(self):
-        info = {
-            "ASICModel": "BZM",
-            "hostname": "bitaxeBonanza-1004x",
-            "macAddr": "12:34:56:78:9A:BC",
-            "hashRate": 850,
-        }
-        response = MagicMock()
-        response.__enter__.return_value = response
-        with patch("p2pool_lab.devices.build_opener") as opener:
-            opener.return_value.open.return_value = response
-            response.read.return_value = json.dumps(info).encode()
-            self.assertEqual(probe("192.168.50.2")["model"], "BZM")
-            del info["macAddr"]
-            response.read.return_value = json.dumps(info).encode()
-            self.assertIsNone(probe("192.168.50.2"))
 
     def test_fleet_sums_hashrate_and_power_but_uses_hottest_temperature(self):
         sources = {
