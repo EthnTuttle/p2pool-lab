@@ -1,11 +1,12 @@
 from contextlib import contextmanager
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from p2pool_lab.devices import DeviceRegistry, fleet_summary, scan_network
+from p2pool_lab.devices import DeviceRegistry, fleet_summary, probe, scan_network
 
 
 class DeviceTests(unittest.TestCase):
@@ -78,6 +79,32 @@ class DeviceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "No responding AxeOS"):
                 self.registry.add("192.168.50.1")
         self.assertEqual(self.registry.devices(), {})
+
+    def test_discovery_accepts_model_names_and_requires_valid_device_fields(self):
+        info = {
+            "ASICModel": "BZM",
+            "hostname": "bitaxeBonanza-1004x",
+            "macAddr": "12:34:56:78:9A:BC",
+            "hashRate": 850,
+        }
+        response = MagicMock()
+        response.__enter__.return_value = response
+        with patch("p2pool_lab.devices.build_opener") as opener:
+            opener.return_value.open.return_value = response
+            for model in ("BM1370", "BZM", "Custom ASIC"):
+                with self.subTest(model=model):
+                    info["ASICModel"] = model
+                    response.read.return_value = json.dumps(info).encode()
+                    self.assertEqual(probe("192.168.50.2")["model"], model)
+            for model in ("", "   ", None, 1370):
+                with self.subTest(invalid_model=model):
+                    response.read.return_value = json.dumps({**info, "ASICModel": model}).encode()
+                    self.assertIsNone(probe("192.168.50.2"))
+            for field in ("ASICModel", "macAddr", "hashRate"):
+                with self.subTest(missing=field):
+                    incomplete = {key: value for key, value in info.items() if key != field}
+                    response.read.return_value = json.dumps(incomplete).encode()
+                    self.assertIsNone(probe("192.168.50.2"))
 
     def test_fleet_sums_hashrate_and_power_but_uses_hottest_temperature(self):
         sources = {
