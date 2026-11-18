@@ -62,9 +62,7 @@ def probe(address):
         if (
             not isinstance(info, dict)
             or not isinstance(info.get("ASICModel"), str)
-            or not (
-                info["ASICModel"].startswith("BM") or info["ASICModel"] == "BZM"
-            )
+            or not info["ASICModel"].strip()
         ):
             return None
         mac = str(info.get("macAddr", "")).lower().replace(":", "")
