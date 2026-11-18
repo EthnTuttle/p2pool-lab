@@ -34,6 +34,11 @@ MINERS = CONFIG.miners
 POOL = CONFIG.pool_url
 DATABASE = ROOT / "data/dashboard.sqlite"
 INTERVAL = 5
+SHARE_BATCH_SIZE = 100
+SHARE_PAGE_BATCHES = 5
+# Consensus parameters for the P2Poolv2 revision in flake.lock.
+SHARE_MATURITY = 6_048
+PAYOUT_WINDOW_SHARES = 120_960
 MINER_FIELDS = (
     "hostname",
     "version",
@@ -104,10 +109,49 @@ def request(url, method="GET", data=None, headers=None, text=False):
     with urlopen(
         Request(url, data=payload, headers=headers, method=method), timeout=4
     ) as response:
+        if text:
+            return response.read().decode()
         body = response.read(4 * 1024 * 1024).decode()
-    if text:
-        return body
     return json.loads(body) if body.strip() else {}
+
+
+def payout_window(height):
+    # The first SHARE_MATURITY heights mature immediately. Referenced uncles
+    # enter and leave the window alongside the confirmed share that cites them.
+    first = height + (1 if height < SHARE_MATURITY else SHARE_MATURITY)
+    last = height + SHARE_MATURITY + PAYOUT_WINDOW_SHARES - 1
+    return first, last
+
+
+def recent_share_interval(shares, now):
+    if len(shares) < 2:
+        return None
+    highest = max(shares, key=lambda share: share["height"])
+    lowest = min(shares, key=lambda share: share["height"])
+    height_span = highest["height"] - lowest["height"]
+    elapsed = highest["timestamp"] - lowest["timestamp"]
+    if height_span <= 0 or elapsed <= 0 or not -300 <= now - highest["timestamp"] <= 900:
+        return None
+    return elapsed / height_span
+
+
+def estimate_share_sats(reward_sats, chain_work, tip, paying_height, bits, weight):
+    exponent = bits >> 24
+    mantissa = bits & 0x7FFFFF
+    shift = 8 * (exponent - 3)
+    target = mantissa << shift if shift >= 0 else mantissa >> -shift
+    if bits & 0x800000 or not 0 < target < 1 << 256 or chain_work <= 0:
+        return None
+    share_work = (1 << 256) // (target + 1)
+    maturity_skip = min(SHARE_MATURITY - 1, max(0, paying_height - SHARE_MATURITY))
+    eligible_count = min(PAYOUT_WINDOW_SHARES, paying_height - maturity_skip)
+    if eligible_count <= 0:
+        return None
+    # Project the payout window using mean work per confirmed height, including
+    # uncle work. Work is proportional to payout difficulty at mining targets.
+    return reward_sats * share_work * weight * (tip + 1) // (
+        10 * chain_work * eligible_count
+    )
 
 
 def bitcoin_rpc(method, params):
@@ -153,8 +197,8 @@ def miner_status(miner_id, url=None):
     return {key: info[key] for key in MINER_FIELDS if key in info}
 
 
-def parse_metrics(text):
-    """Keep pool scalars and the latest blocks, without returning the full exposition."""
+def parse_metrics(text, payout_address):
+    """Count lab finds across the recorded history and keep the latest pool rows."""
     values = {}
     blocks = []
     for line in text.splitlines():
@@ -167,8 +211,19 @@ def parse_metrics(text):
             labels = dict(re.findall(r'(\w+)="([^"\\]*)"', line))
             labels["timestamp"] = float(line.rsplit(" ", 1)[1])
             blocks.append(labels)
+    # An incomplete metrics response must not look like a lower block count.
+    lab_blocks_found = None
+    if payout_address and values.get("bitcoin_blocks_found_total") == len(blocks):
+        lab_blocks_found = len(
+            {
+                block["blockhash"]
+                for block in blocks
+                if block.get("miner") == payout_address and block.get("blockhash")
+            }
+        )
     return {
         "values": values,
+        "lab_blocks_found": lab_blocks_found,
         "blocks": sorted(blocks, key=lambda block: block["timestamp"], reverse=True)[
             :8
         ],
@@ -341,13 +396,84 @@ class Monitor:
             )
         return data
 
+    def owner_shares(self, to_height):
+        owner = self.settings["share_owner_address"]
+        shares_url = f"{POOL}/shares?num={SHARE_BATCH_SIZE}"
+        latest = request(shares_url)
+        payout_inputs = None
+        try:
+            chain = request(POOL + "/chain_info")
+            template = bitcoin_rpc(
+                "getblocktemplate", [{"rules": ["segwit", "consensuscleanup"]}]
+            )
+            payout_inputs = (
+                template["coinbasevalue"],
+                int(chain["total_work"], 16),
+                chain["chain_tip_height"],
+            )
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError):
+            logging.debug("Share payout estimate inputs unavailable", exc_info=True)
+        matches = {}
+        newest_height = None
+        for _ in range(SHARE_PAGE_BATCHES):
+            batch = (
+                latest if to_height is None else request(f"{shares_url}&to={to_height}")
+            )
+            if newest_height is None:
+                newest_height = batch["to_height"]
+            oldest_height = batch["from_height"]
+            for share in batch["shares"]:
+                uncles = [(uncle, "Uncle", 9) for uncle in share["uncles"]]
+                # /shares omits uncle targets. Use the referencing share's
+                # target for uncle work and for the 10% bonus it earns.
+                entries = [(share, "Confirmed", 10 + len(uncles)), *uncles]
+                for entry, kind, weight in entries:
+                    if entry["miner_address"] == owner:
+                        first, last = payout_window(share["height"])
+                        pay_at = max(latest["to_height"] + 1, first)
+                        estimate = (
+                            estimate_share_sats(
+                                *payout_inputs, pay_at, share["bits"], weight
+                            )
+                            if payout_inputs and pay_at <= last
+                            else None
+                        )
+                        matches[entry["blockhash"]] = {
+                            "blockhash": entry["blockhash"],
+                            "height": entry["height"],
+                            "timestamp": entry["timestamp"],
+                            "kind": kind,
+                            "payout_from_height": first,
+                            "payout_through_height": last,
+                            "estimated_block_sats": estimate,
+                        }
+            if oldest_height == 0:
+                break
+            to_height = oldest_height - 1
+        now = time.time()
+        return {
+            "from_height": oldest_height,
+            "to_height": newest_height,
+            "tip_height": latest["to_height"],
+            "estimate_time": now,
+            "seconds_per_share": recent_share_interval(latest["shares"], now),
+            "shares": sorted(
+                matches.values(),
+                key=lambda share: share["timestamp"],
+                reverse=True,
+            ),
+        }
+
     def collect(self):
         miners = self.registry.devices()
         loaders = {
             "bitcoin": bitcoin_status,
             "chain": lambda: request(POOL + "/chain_info"),
             "peers": lambda: request(POOL + "/peers"),
-            "metrics": lambda: parse_metrics(request(POOL + "/metrics", text=True)),
+            "metrics": lambda: parse_metrics(
+                request(POOL + "/metrics", text=True),
+                self.settings["bitcoin_payout_address"],
+            ),
         }
         for miner_id, device in miners.items():
             loaders["miner-" + miner_id] = lambda miner_id=miner_id, url=device["url"]: (
@@ -621,6 +747,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(self.server.monitor.wallet.snapshot())
             if path.path == "/api/devices/discovery":
                 return self.reply(self.server.monitor.registry.discovery())
+            if path.path == "/api/owner-shares":
+                to = parse_qs(path.query, keep_blank_values=True).get("to", [])
+                to_height = int(to[0]) if to else None
+                if len(to) > 1 or (
+                    to_height is not None and not 0 <= to_height <= 0xFFFFFFFF
+                ):
+                    return self.reply({"error": "Invalid share height"}, 400)
+                return self.reply(self.server.monitor.owner_shares(to_height))
             if path.path == "/api/wallet/qr":
                 address = parse_qs(path.query).get("address", [""])[0]
                 return self.reply(

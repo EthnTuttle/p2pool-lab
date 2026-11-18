@@ -56,7 +56,7 @@
         <div class="panel-heading"><div><p class="eyebrow">P2POOLV2</p><h2>Share chain</h2></div><span id="chain-badge" class="badge">Connecting</span></div>
         <div class="chain-number"><strong id="share-height">—</strong><span>confirmed height</span></div>
         <dl class="details"><div><dt>Candidate height</dt><dd id="candidate-height">—</dd></div><div><dt>Connected pool peers</dt><dd id="peer-count">—</dd></div><div><dt>Shares accepted by this node</dt><dd id="pool-accepted">—</dd></div><div><dt>Shares rejected by this node</dt><dd id="pool-rejected">—</dd></div><div><dt>Network difficulty</dt><dd id="network-difficulty">—</dd></div></dl>
-        <a class="text-link" id="explorer-link" target="_blank" rel="noopener noreferrer">Explore the share chain ↗</a>
+        <div class="share-links"><a class="text-link" href="#owner-shares">View your shares ↓</a><a class="text-link" href="#pool-blocks">View block counts ↓</a><a class="text-link" id="explorer-link" target="_blank" rel="noopener noreferrer">Explore the share chain ↗</a></div>
       </section>
       <section class="panel wallet-panel">
         <div class="panel-heading"><div><p class="eyebrow">BDK WALLET</p><h2>Testnet payouts</h2></div><span id="wallet-badge" class="badge">Connecting</span></div>
@@ -68,6 +68,18 @@
         <a class="text-link" href="#wallet">Open wallet · receive and send →</a>
       </section>
     </div>
+    <section class="panel blocks-panel" id="owner-shares">
+      <div class="panel-heading">
+        <div><h2>Your shares</h2><p class="muted" id="share-page-status" role="status">Loading shares…</p></div>
+        <div class="share-page-buttons"><button id="share-latest" disabled>Latest</button><button id="share-older" disabled>Older</button></div>
+      </div>
+      <div class="table-wrap share-table" id="share-table" tabindex="0" role="region" aria-label="Shares belonging to this lab"><table>
+        <thead><tr><th>Share height</th><th class="share-found">Found</th><th class="share-type">Type</th><th>Payout window</th><th class="share-value">Est. test sats / block</th><th>Share hash</th></tr></thead>
+        <tbody id="share-rows"><tr><td colspan="6" class="empty">Waiting for the sharechain</td></tr></tbody>
+      </table></div>
+      <p class="footnote">Includes shares and referenced uncles credited to this lab’s shared owner address. Payout windows use the confirmed sharechain tip, and dates use the latest 100 shares’ pace. Payment depends on the pool finding a Bitcoin block while the share is eligible for that block.</p>
+      <p class="footnote">Estimated test sats use the current block reward and average sharechain work for one eligible pool block. Uncle estimates use the referencing share’s difficulty. Your share-owner keys stay on this lab. <a class="text-link" href="https://docs.p2poolv2.org/payouts/marketplace.html" target="_blank" rel="noopener noreferrer">How share trading works ↗</a></p>
+    </section>
     <section class="panel devices-panel" id="devices">
       <div class="panel-heading"><div><p class="eyebrow">MULTI-AXE</p><h2>Discover & manage miners</h2></div><span id="device-count" class="muted">—</span></div>
       <div class="device-forms"><form id="discovery-form"><label for="discovery-cidr">LAN subnet · /24 or smaller</label><div class="inline-form"><input id="discovery-cidr" placeholder="192.168.1.0/24" required><button id="discover-button" type="submit">Discover</button></div></form><form id="add-device-form"><label for="add-device-ip">Add a miner by IP</label><div class="inline-form"><input id="add-device-ip" placeholder="192.168.1.123" required><button id="add-device-button" type="submit">Add miner</button></div></form></div>
@@ -96,10 +108,14 @@
       <div id="wallet-pending-transfers"></div>
       <div id="wallet-message" class="action-result" role="status" aria-live="polite"></div>
     </section>
-    <section class="panel blocks-panel">
-      <div class="panel-heading"><div><p class="eyebrow">ACROSS THE SHARE CHAIN</p><h2>Latest pool blocks</h2></div><span id="blocks-count" class="muted">—</span></div>
+    <section class="panel blocks-panel" id="pool-blocks">
+      <div class="panel-heading"><h2>Bitcoin blocks found</h2></div>
+      <dl class="block-counts">
+        <div><dt>This lab</dt><dd id="lab-blocks-count">—</dd></div>
+        <div><dt>Across P2Poolv2</dt><dd id="blocks-count">—</dd></div>
+      </dl>
       <div class="table-wrap"><table><thead><tr><th>Bitcoin height</th><th>Found</th><th>Block hash</th><th>Miner</th></tr></thead><tbody id="blocks"><tr><td colspan="4" class="empty">Waiting for pool metrics</td></tr></tbody></table></div>
-      <p class="footnote">Blocks recorded by P2Pool across all miners, including synced history; this is not a count of blocks found by your Bitaxe.</p>
+      <p class="footnote">The lab count matches finds to its configured payout address. The table shows the latest eight finds recorded across the pool.</p>
     </section>
     <section class="panel" id="activity">
       <div class="panel-heading"><div><p class="eyebrow">OPERATIONS</p><h2>Activity & logs</h2></div><div class="log-controls"><label class="sr-only" for="log-source">Log source</label><select id="log-source"><option value="pool">P2Poolv2 logs</option><option value="bitcoin">rbitcoin logs</option><option value="bridge">Block bridge logs</option></select><button id="load-logs">Load logs</button></div></div>
