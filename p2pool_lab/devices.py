@@ -1,14 +1,30 @@
 """Persistent AxeOS device inventory and bounded, read-only LAN discovery."""
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from http.client import HTTPConnection, HTTPException, HTTPResponse, HTTPSConnection
 import ipaddress
 import json
+import logging
 import math
 import re
+import socket
+import sqlite3
 import threading
 import time
 from urllib.error import HTTPError
-from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
+from urllib.request import (
+    HTTPHandler,
+    HTTPRedirectHandler,
+    HTTPSHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
+)
+
+SQLITE_INT_MIN, SQLITE_INT_MAX = -(2**63), 2**63 - 1
+MAX_TELEMETRY = 1e15
+PROBE_TIMEOUT = 2
+DISCOVERY_GRACE = 1
 
 PRIVATE_NETWORKS = tuple(
     ipaddress.ip_network(value)
@@ -18,6 +34,7 @@ PRIVATE_NETWORKS = tuple(
 
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, request, response, code, message, headers, new_url):
+        response.close()
         raise HTTPError(
             request.full_url,
             code,
@@ -25,6 +42,226 @@ class NoRedirect(HTTPRedirectHandler):
             headers,
             response,
         )
+
+
+class DeadlineHTTPResponse(HTTPResponse):
+    """Close the per-connection watchdog as soon as the body is consumed."""
+
+    _deadline_connection = None
+
+    def _close_conn(self):
+        try:
+            super()._close_conn()
+        finally:
+            connection = self._deadline_connection
+            self._deadline_connection = None
+            if connection is not None:
+                connection.cancel_deadline()
+
+
+class DeadlineHTTPConnection(HTTPConnection):
+    """HTTP connection whose daemon watchdog interrupts all socket phases."""
+
+    response_class = DeadlineHTTPResponse
+
+    def __init__(self, *args, deadline=None, **kwargs):
+        self._absolute_deadline = deadline
+        self._deadline_timer = None
+        self._deadline_expired = False
+        super().__init__(*args, **kwargs)
+        self._create_connection = self._deadline_create_connection
+
+    def _deadline_create_connection(self, address, timeout, source_address):
+        """Connect without DNS; lab HTTP targets must be numeric IP literals."""
+        host, port = address
+        try:
+            ipaddress.ip_address(host)
+        except ValueError as error:
+            raise OSError(
+                "Outbound HTTP targets must use numeric IP addresses; DNS names are not resolved"
+            ) from error
+        last_error = None
+        # AI_NUMERICHOST makes resolution a numeric parse only. No resolver can
+        # escape the absolute deadline because hostname targets were rejected.
+        for family, kind, proto, _, sockaddr in socket.getaddrinfo(
+            host, port, 0, socket.SOCK_STREAM, flags=socket.AI_NUMERICHOST
+        ):
+            sock = None
+            try:
+                remaining = self._absolute_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Outbound connection exceeded its deadline")
+                effective_timeout = remaining
+                if (
+                    timeout is not None
+                    and timeout is not socket._GLOBAL_DEFAULT_TIMEOUT
+                ):
+                    effective_timeout = min(timeout, remaining)
+                sock = socket.socket(family, kind, proto)
+                self.sock = sock
+                sock.settimeout(effective_timeout)
+                if source_address:
+                    sock.bind(source_address)
+                sock.connect(sockaddr)
+                return sock
+            except OSError as error:
+                if sock is not None:
+                    sock.close()
+                    if self.sock is sock:
+                        self.sock = None
+                if (
+                    self._deadline_expired
+                    or time.monotonic() >= self._absolute_deadline
+                ):
+                    raise TimeoutError(
+                        "Outbound connection exceeded its deadline"
+                    ) from error
+                last_error = error
+        if last_error is not None:
+            raise last_error
+        raise OSError("getaddrinfo returned no connection candidates")
+
+    def _expire(self):
+        self._deadline_expired = True
+        sock = self.sock
+        if sock is not None:
+            try:
+                # shutdown wakes another thread blocked in header/body reads;
+                # close alone is not reliable while SocketIO holds a reference.
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        self.close()
+
+    def cancel_deadline(self):
+        timer = self._deadline_timer
+        self._deadline_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def connect(self):
+        deadline = self._absolute_deadline
+        if deadline is None:
+            deadline = time.monotonic() + self.timeout
+            self._absolute_deadline = deadline
+        timer = threading.Timer(max(0, deadline - time.monotonic()), self._expire)
+        timer.daemon = True
+        self._deadline_timer = timer
+        timer.start()
+        try:
+            # Numeric-only addressing avoids resolver waits. TCP, TLS, headers
+            # and bodies remain interruptible by the absolute-deadline watchdog.
+            super().connect()
+            if self._deadline_expired or time.monotonic() >= deadline:
+                self._expire()
+                raise TimeoutError("Outbound connection exceeded its deadline")
+        except BaseException:
+            self.cancel_deadline()
+            self.close()
+            raise
+
+    def request(self, *args, **kwargs):
+        try:
+            return super().request(*args, **kwargs)
+        except BaseException:
+            self.cancel_deadline()
+            self.close()
+            raise
+
+    def getresponse(self):
+        try:
+            response = super().getresponse()
+        except BaseException:
+            self.cancel_deadline()
+            self.close()
+            raise
+        response._deadline_connection = self
+        return response
+
+
+class DeadlineHTTPSConnection(DeadlineHTTPConnection, HTTPSConnection):
+    """TLS variant; HTTPSConnection wraps the watchdog-managed raw socket."""
+
+
+class DeadlineHTTPHandler(HTTPHandler):
+    def http_open(self, request):
+        return self.do_open(
+            DeadlineHTTPConnection,
+            request,
+            deadline=getattr(request, "_p2pool_deadline", None),
+        )
+
+
+class DeadlineHTTPSHandler(HTTPSHandler):
+    def https_open(self, request):
+        return self.do_open(
+            DeadlineHTTPSConnection,
+            request,
+            deadline=getattr(request, "_p2pool_deadline", None),
+        )
+
+
+def deadline_opener():
+    return build_opener(
+        ProxyHandler({}), NoRedirect(), DeadlineHTTPHandler(), DeadlineHTTPSHandler()
+    )
+
+
+def open_response(opener, request, timeout, deadline):
+    request._p2pool_deadline = deadline
+    try:
+        return opener.open(request, timeout=timeout)
+    except HTTPError as error:
+        error.close()
+        raise
+
+
+def finite_number(value):
+    """Return a finite value bounded for JSON, SQLite and fleet aggregates."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, int):
+        return value if SQLITE_INT_MIN <= value <= SQLITE_INT_MAX else None
+    try:
+        return value if math.isfinite(value) and abs(value) <= MAX_TELEMETRY else None
+    except OverflowError:
+        return None
+
+
+def safe_text(value, limit=256):
+    """Return a bounded UTF-8 string, or None for arbitrary containers/types."""
+    if not isinstance(value, str):
+        return None
+    return value.encode("utf-8", errors="replace").decode()[:limit]
+
+
+def read_response(response, deadline, limit):
+    """Read a bounded body without allowing a slow drip to exceed a deadline."""
+    chunks = []
+    size = 0
+    read = getattr(response, "read1", response.read)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Outbound request exceeded its deadline")
+        # urllib's HTTPResponse exposes its socket here. Reducing its timeout
+        # also bounds a stalled read; read1 returns each available chunk so a
+        # slow drip reaches the monotonic checks below.
+        sock = getattr(
+            getattr(getattr(response, "fp", None), "raw", None), "_sock", None
+        )
+        if sock is not None:
+            sock.settimeout(remaining)
+        chunk = read(min(64 * 1024, limit - size + 1))
+        if time.monotonic() > deadline:
+            raise TimeoutError("Outbound request exceeded its deadline")
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > limit:
+            raise ValueError("Outbound response is too large")
+    return b"".join(chunks)
 
 
 def private_address(value):
@@ -56,26 +293,26 @@ def scan_network(value):
 def probe(address):
     address = private_address(address)
     try:
-        opener = build_opener(ProxyHandler({}), NoRedirect())
-        with opener.open(f"http://{address}/api/system/info", timeout=2) as response:
-            info = json.loads(response.read(128 * 1024))
-        if (
-            not isinstance(info, dict)
-            or not isinstance(info.get("ASICModel"), str)
-            or not info["ASICModel"].strip()
-        ):
+        deadline = time.monotonic() + PROBE_TIMEOUT
+        opener = deadline_opener()
+        request = Request(f"http://{address}/api/system/info")
+        with open_response(opener, request, PROBE_TIMEOUT, deadline) as response:
+            info = json.loads(read_response(response, deadline, 128 * 1024))
+        model = safe_text(info.get("ASICModel"), 64) if isinstance(info, dict) else None
+        if not model or not model.strip():
             return None
-        mac = str(info.get("macAddr", "")).lower().replace(":", "")
+        mac_value = info.get("macAddr")
+        mac = mac_value.lower().replace(":", "") if isinstance(mac_value, str) else ""
         if not re.fullmatch(r"[0-9a-f]{12}", mac) or "hashRate" not in info:
             return None
         return {
             "address": address,
             "mac": mac,
-            "name": str(info.get("hostname", "Bitaxe"))[:64],
-            "model": info["ASICModel"],
-            "version": str(info.get("version", "unknown"))[:32],
+            "name": safe_text(info.get("hostname"), 64) or "Bitaxe",
+            "model": model,
+            "version": safe_text(info.get("version"), 32) or "unknown",
         }
-    except (OSError, ValueError, TypeError):
+    except (HTTPException, OSError, ValueError, TypeError, RecursionError):
         return None
 
 
@@ -83,6 +320,8 @@ class DeviceRegistry:
     def __init__(self, connect, configured):
         self.connect = connect
         self.lock = threading.Lock()
+        self.executor = ThreadPoolExecutor(max_workers=16)
+        self._probe_futures = set()
         self.scan = {
             "running": False,
             "checked": 0,
@@ -96,11 +335,19 @@ class DeviceRegistry:
                 "CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, name TEXT, url TEXT UNIQUE, worker TEXT, mac TEXT UNIQUE, enabled INTEGER NOT NULL DEFAULT 1)"
             )
             for identifier, device in configured.items():
-                connection.execute(
-                    """INSERT INTO devices(id,name,url,worker) VALUES (?,?,?,?)
-                    ON CONFLICT(id) DO UPDATE SET name=excluded.name,url=CASE WHEN devices.enabled=1 THEN excluded.url ELSE devices.url END,worker=excluded.worker""",
-                    (identifier, device["name"], device["url"], device["worker"]),
-                )
+                try:
+                    connection.execute(
+                        """INSERT INTO devices(id,name,url,worker) VALUES (?,?,?,?)
+                        ON CONFLICT(id) DO UPDATE SET name=excluded.name,url=CASE WHEN devices.enabled=1 THEN excluded.url ELSE devices.url END,worker=excluded.worker""",
+                        (identifier, device["name"], device["url"], device["worker"]),
+                    )
+                except sqlite3.IntegrityError:
+                    # A dashboard-added device may already own this URL. Keep
+                    # its inventory and continue importing the remaining rows.
+                    logging.warning(
+                        "Configured miner %s conflicts with an existing device; skipping it",
+                        identifier,
+                    )
 
     def devices(self):
         with self.connect() as connection:
@@ -221,19 +468,40 @@ class DeviceRegistry:
         return self.discovery()
 
     def _scan(self, addresses):
+        futures = []
         try:
-            with ThreadPoolExecutor(max_workers=16) as executor:
-                futures = [executor.submit(probe, address) for address in addresses]
-                for future in as_completed(futures):
+            with self.lock:
+                unfinished = any(not future.done() for future in self._probe_futures)
+                self._probe_futures = {
+                    future for future in self._probe_futures if future.done()
+                }
+            if unfinished:
+                # A non-network callable may be uninterruptible. Do not queue a
+                # second scan behind it; real probes have socket watchdogs.
+                raise TimeoutError("Previous discovery probes are still stopping")
+            futures = [self.executor.submit(probe, address) for address in addresses]
+            self._probe_futures = set(futures)
+            waves = max(1, (len(addresses) + 15) // 16)
+            deadline = time.monotonic() + waves * PROBE_TIMEOUT + DISCOVERY_GRACE
+            for future in as_completed(
+                futures, timeout=max(0, deadline - time.monotonic())
+            ):
+                try:
                     found = future.result()
-                    with self.lock:
-                        self.scan["checked"] += 1
-                        if found:
-                            self.scan["results"].append(found)
+                except Exception:
+                    logging.debug("A discovery probe failed", exc_info=True)
+                    found = None
+                with self.lock:
+                    self.scan["checked"] += 1
+                    if found:
+                        self.scan["results"].append(found)
         except Exception:
+            logging.debug("Discovery did not finish cleanly", exc_info=True)
             with self.lock:
                 self.scan["error"] = "Discovery could not complete"
         finally:
+            for future in futures:
+                future.cancel()
             with self.lock:
                 self.scan["running"] = False
                 self.scan["finished_at"] = int(time.time())
@@ -244,21 +512,22 @@ def fleet_summary(sources, devices, now):
         sources["miner-" + identifier]["data"]
         for identifier in devices
         if sources.get("miner-" + identifier, {}).get("ok")
+        and isinstance(sources["miner-" + identifier].get("data"), dict)
         and now - sources["miner-" + identifier]["updated_at"] < 35
     ]
 
     def values(key):
-        return [
-            item[key]
-            for item in live
-            if isinstance(item.get(key), (int, float))
-            and not isinstance(item[key], bool)
-            and math.isfinite(item[key])
-        ]
+        readings = (finite_number(item.get(key)) for item in live)
+        return [value for value in readings if value is not None]
 
     def total(key):
         items = values(key)
-        return sum(items) if items else None
+        if not items:
+            return None
+        try:
+            return finite_number(sum(items))
+        except OverflowError:
+            return None
 
     temperatures = values("temp")
     return {

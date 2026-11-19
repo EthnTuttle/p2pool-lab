@@ -1,7 +1,11 @@
 """Public configuration; wallet keys and RPC credentials belong in runtime state."""
 
+import base64
 from dataclasses import dataclass, field
+import hashlib
+import hmac
 import ipaddress
+import json
 import os
 from pathlib import Path
 import re
@@ -9,6 +13,20 @@ import tomllib
 from urllib.parse import urlsplit
 
 GENESIS = "00000000000008c1637e7d3252dc1c333d4546fd6fff6a474b200d674a91d497"
+
+# Private runtime file (under state_dir) holding the generated P2Pool API
+# credentials: username, password, salt and HMAC token.
+POOL_AUTH_FILE = "data/p2pool-api-auth.json"
+
+
+def pool_auth_token(salt, password):
+    """P2Poolv2 API token: salt$hex(HMAC-SHA256(key=salt ASCII bytes, message=password)).
+
+    Matches upstream p2poolv2 auth.rs, which uses the salt string's ASCII
+    bytes as the HMAC key, not the decoded hex.
+    """
+    digest = hmac.new(salt.encode(), password.encode(), hashlib.sha256).hexdigest()
+    return f"{salt}${digest}"
 
 
 @dataclass(frozen=True)
@@ -18,6 +36,7 @@ class Config:
     )
     config_path: Path | None = None
     bind_host: str = "127.0.0.1"
+    dashboard_host: str = "127.0.0.1"
     public_host: str = "127.0.0.1"
     dashboard_port: int = 8080
     stratum_port: int = 3333
@@ -41,14 +60,32 @@ class Config:
 
     @property
     def origin(self):
-        return f"http://{self.public_host}:{self.dashboard_port}"
+        host = (
+            self.public_host
+            if self.dashboard_host == "0.0.0.0"
+            else self.dashboard_host
+        )
+        return f"http://{host}:{self.dashboard_port}"
 
     @property
     def allowed_hosts(self):
-        return {
-            f"{host}:{self.dashboard_port}"
-            for host in (self.public_host, "localhost", "127.0.0.1")
-        }
+        hosts = {self.public_host, "localhost", "127.0.0.1"}
+        if self.dashboard_host != "0.0.0.0":
+            hosts.add(self.dashboard_host)
+        return {f"{host}:{self.dashboard_port}" for host in hosts}
+
+    @property
+    def pool_auth_headers(self):
+        """Basic auth headers for the P2Pool API, read from private runtime state."""
+        try:
+            data = json.loads((self.state_dir / POOL_AUTH_FILE).read_text())
+            username, password = data["username"], data["password"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return {}
+        if not isinstance(username, str) or not isinstance(password, str):
+            return {}
+        encoded = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
+        return {"Authorization": f"Basic {encoded}"}
 
     @property
     def pool_url(self):
@@ -97,7 +134,7 @@ def load(path=None):
     }:
         raise ValueError("Unknown runtime or bitcoin setting")
     ports = {key for key in Config.__dataclass_fields__ if key.endswith("_port")}
-    if set(network) - ports - {"bind_host", "public_host"}:
+    if set(network) - ports - {"bind_host", "dashboard_host", "public_host"}:
         raise ValueError("Unknown network setting")
     for name, value in network.items():
         if name in ports and (type(value) is not int or not 1024 <= value <= 65535):
@@ -106,11 +143,12 @@ def load(path=None):
             not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", value)
         ):
             raise ValueError(f"{name} must be an IPv4 address or hostname")
-    if "bind_host" in network:
-        try:
-            ipaddress.IPv4Address(network["bind_host"])
-        except ValueError as error:
-            raise ValueError("bind_host must be an IPv4 address") from error
+    for name in ("bind_host", "dashboard_host"):
+        if name in network:
+            try:
+                ipaddress.IPv4Address(network[name])
+            except ValueError as error:
+                raise ValueError(f"{name} must be an IPv4 address") from error
     state = Path(runtime.get("state_dir", "~/.local/share/p2pool-lab")).expanduser()
     if not state.is_absolute():
         state = config_path.parent / state
@@ -168,6 +206,15 @@ def load(path=None):
             raise ValueError(
                 f"Miner {identifier} needs an HTTP(S) origin without credentials or a path"
             )
+        # IPv4 literals only: the dashboard enforces an absolute request
+        # deadline, which cannot interrupt a stalled DNS resolver.
+        try:
+            ipaddress.IPv4Address(parsed.hostname)
+        except ValueError as error:
+            raise ValueError(
+                f"Miner {identifier} URL must use the miner's IPv4 address; "
+                "DNS names are not resolved"
+            ) from error
         worker = miner.get("worker", identifier)
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", worker):
             raise ValueError(f"Invalid worker name for miner {identifier}")

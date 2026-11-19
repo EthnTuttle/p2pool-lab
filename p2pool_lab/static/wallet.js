@@ -16,6 +16,7 @@
     for (const id of ["wallet-refresh", "wallet-new-address", "wallet-preview-button", "wallet-confirm", "wallet-cancel"]) byId(id).disabled = busy;
     byId("wallet-cancel").disabled = busy || broadcastUncertain;
     document.querySelectorAll("[data-retry-transfer]").forEach(button => button.disabled = busy);
+    document.querySelectorAll("[data-abandon-transfer]").forEach(button => button.disabled = busy);
   }
   function tab(name) {
     activeTab = name;
@@ -71,16 +72,43 @@
       cell.colSpan = 4; row.append(cell); rows.push(row);
     }
     byId("wallet-transactions").replaceChildren(...rows);
-    const pending = (data.transfers || []).filter(transfer => transfer.status === "signed");
-    byId("wallet-pending-transfers").replaceChildren(...pending.map(transfer => {
-      const panel = element("div", undefined, "pending-transfer");
-      panel.append(element("strong", "Saved transfer · broadcast not yet confirmed"));
-      panel.append(element("p", `${number(transfer.amount_sat)} test sats to ${transfer.address}. Fee: ${number(transfer.fee_sat)} sats.`));
-      const retry = element("button", "Retry this same transfer");
-      retry.dataset.retryTransfer = transfer.draft_id;
-      retry.addEventListener("click", () => { draft = transfer; broadcastUncertain = true; showPreview(); tab("send"); send(); });
-      panel.append(retry); return panel;
-    }));
+    const transfers = data.transfers || [];
+    const pending = transfers.filter(transfer => transfer.status === "signed");
+    const finished = transfers.filter(transfer => ["failed", "superseded", "abandoned"].includes(transfer.status));
+    byId("wallet-pending-transfers").replaceChildren(
+      ...pending.map(transfer => {
+        const panel = element("div", undefined, "pending-transfer");
+        panel.append(element("strong", "Saved transfer · broadcast not yet confirmed"));
+        panel.append(element("p", `${number(transfer.amount_sat)} test sats to ${transfer.address}. Fee: ${number(transfer.fee_sat)} sats.`));
+        const retry = element("button", "Retry this same transfer");
+        retry.dataset.retryTransfer = transfer.draft_id;
+        retry.addEventListener("click", () => { draft = transfer; broadcastUncertain = true; showPreview(); tab("send"); send(); });
+        const abandonButton = element("button", "Abandon this transfer");
+        abandonButton.dataset.abandonTransfer = transfer.draft_id;
+        abandonButton.addEventListener("click", async () => {
+          if (busy) return;
+          const warning = "Abandoning permanently closes this saved transfer so you can create new payments; it cannot be undone. Only continue if the node keeps failing to broadcast it. If the transaction is actually still propagating, a replacement payment could conflict with it and one of the two spends would be rejected by the network. Abandon this transfer?";
+          if (!window.confirm(warning)) return;
+          busy = true; controls(); message("Checking the saved transfer with the node…");
+          try {
+            await walletPost("abandon", {draft_id: transfer.draft_id, confirmed: true});
+            message("Transfer abandoned. You can create a new payment.");
+          } catch (error) { message(error.message, true); }
+          await getWallet();
+          busy = false; controls();
+        });
+        panel.append(retry, abandonButton); return panel;
+      }),
+      ...finished.map(transfer => {
+        // Terminal transfers can never be retried; they only explain what happened.
+        const panel = element("div", undefined, "pending-transfer");
+        const heading = transfer.status === "failed" ? "Transfer failed · cannot be retried" : transfer.status === "abandoned" ? "Transfer abandoned · cannot be retried" : "Transfer withdrawn · another payment was signed first";
+        panel.append(element("strong", heading));
+        panel.append(element("p", `${number(transfer.amount_sat)} test sats to ${transfer.address}. Fee: ${number(transfer.fee_sat)} sats.`));
+        if (transfer.reason) panel.append(element("p", transfer.reason));
+        return panel;
+      })
+    );
     controls();
   }
   async function getWallet() {
@@ -122,6 +150,10 @@
       if (transfer?.status === "broadcast") {
         message(`Transaction submitted: ${transfer.txid}`);
         draft = null; broadcastUncertain = false; showPreview();
+      } else if (["failed", "superseded", "abandoned"].includes(transfer?.status)) {
+        // Terminal: this draft can never be sent, and it must not block a new preview.
+        broadcastUncertain = false; draft = null; showPreview();
+        message(transfer.reason || error.message, true);
       } else {
         if (error.status && current && !transfer) broadcastUncertain = false;
         message(error.message, true); showPreview();

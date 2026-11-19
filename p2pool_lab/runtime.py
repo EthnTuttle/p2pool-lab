@@ -11,7 +11,7 @@ import tomllib
 
 from embit import script
 
-from .config import GENESIS
+from .config import GENESIS, POOL_AUTH_FILE, pool_auth_token
 
 
 def private_write(path, content):
@@ -24,6 +24,43 @@ def private_write(path, content):
         output.flush()
         os.fsync(output.fileno())
     os.replace(temporary, path)
+
+
+def ensure_pool_auth(config):
+    """Load the P2Pool API credentials, generating them once if missing.
+
+    The credentials are private runtime data: a fixed username, a random
+    URL-safe password, a random hex salt, and the HMAC token P2Poolv2 expects.
+    Existing credentials are preserved so initialization stays idempotent, and
+    owner-only permissions are restored on an existing valid file.
+    """
+    path = config.state_dir / POOL_AUTH_FILE
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text())
+            if (
+                isinstance(data, dict)
+                and all(
+                    isinstance(data.get(key), str)
+                    for key in ("username", "password", "salt", "token")
+                )
+                and data["token"] == pool_auth_token(data["salt"], data["password"])
+            ):
+                os.chmod(path, 0o600)
+                os.chmod(path.parent, 0o700)
+                return data
+        except (OSError, ValueError):
+            pass
+    data = {
+        "username": "p2pool-lab",
+        "password": secrets.token_urlsafe(32),
+        "salt": secrets.token_hex(16),
+    }
+    data["token"] = pool_auth_token(data["salt"], data["password"])
+    private_write(path, json.dumps(data, indent=2) + "\n")
+    os.chmod(path.parent, 0o700)
+    return data
 
 
 def run_bdk(arguments, environment=None):
@@ -115,6 +152,7 @@ def render_toml(sections):
 
 def render_nodes(config, settings, credential):
     root = config.state_dir
+    auth = ensure_pool_auth(config)
     bitcoin = [
         "network=testnet5",
         f"datadir={root / 'data/rbitcoin-testnet5'}",
@@ -179,9 +217,58 @@ def render_nodes(config, settings, credential):
             "level": "info",
             "stats_dir": str(root / "logs/stats"),
         },
-        "api": {"hostname": config.bind_host, "port": config.api_port},
+        "api": {
+            "hostname": config.bind_host,
+            "port": config.api_port,
+            "auth_user": auth["username"],
+            "auth_token": auth["token"],
+        },
     }
     private_write(root / "config.toml", render_toml(sections))
+
+
+def ensure_runtime_config(config):
+    """Re-render the node configuration for an already-initialized state dir.
+
+    Upgrade path: state directories initialized before P2Pool API credentials
+    existed keep an unauthenticated ``[api]`` section until the rendered config
+    is refreshed. This runs before every pool launch so the pool never starts
+    without authentication. Idempotent, and guarded by the same marker/lock as
+    ``initialize`` for cross-process safety.
+    """
+    root = config.state_dir
+    marker = root / ".p2pool-lab"
+    settings_path = root / "miner-settings.json"
+    cookie = root / "data/rpc.cookie"
+    if not (marker.exists() and settings_path.exists() and cookie.exists()):
+        raise RuntimeError(
+            "State directory is not fully initialized. Run 'p2pool-lab init' first."
+        )
+    with marker.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            settings = json.loads(settings_path.read_text())
+            credential = cookie.read_text()
+        except (OSError, ValueError) as error:
+            raise RuntimeError(
+                "Runtime state is unreadable. Restore backups or re-run "
+                "'p2pool-lab init' in a fresh state directory."
+            ) from error
+        if (
+            not isinstance(settings, dict)
+            or "bitcoin_payout_address" not in settings
+            or "share_owner_address" not in settings
+            or ":" not in credential
+        ):
+            raise RuntimeError(
+                "Runtime state is incomplete. Restore backups or re-run "
+                "'p2pool-lab init' in a fresh state directory."
+            )
+        render_nodes(config, settings, credential)
+        rendered = tomllib.loads((root / "config.toml").read_text())
+        api = rendered.get("api", {})
+        if not api.get("auth_user") or not api.get("auth_token"):
+            raise RuntimeError("Refusing to start the pool without API authentication.")
 
 
 def initialize(config):

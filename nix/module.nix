@@ -28,7 +28,10 @@ let
     serviceConfig = {
       User = "p2pool-lab";
       Group = "p2pool-lab";
-      SupplementaryGroups = [ "systemd-journal" ];
+      # Only the dashboard reads journalctl output from the other units.
+      SupplementaryGroups = lib.optionals (component == "dashboard") [
+        "systemd-journal"
+      ];
       ExecStart = "${command} ${component}";
       Restart = "on-failure";
       RestartSec = 10;

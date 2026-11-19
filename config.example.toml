@@ -4,8 +4,15 @@ state_dir = "~/.local/share/p2pool-lab"
 log_scope = "user"
 
 [network]
-# Loopback by default. For LAN miners, use your host's LAN address for both.
+# bind_host is the listener address for Stratum, the P2Pool share-peer
+# network, and the authenticated P2Pool API/explorer. Loopback by default;
+# use your host's LAN address for physical miners.
 bind_host = "127.0.0.1"
+# dashboard_host is the wallet dashboard listener, independent of bind_host.
+# It stays on loopback unless you set it explicitly to a LAN address (or
+# "0.0.0.0", with public_host naming what browsers should use).
+dashboard_host = "127.0.0.1"
+# public_host is the address or hostname browsers and miners actually use.
 public_host = "127.0.0.1"
 dashboard_port = 8080
 stratum_port = 3333
@@ -21,6 +28,9 @@ zmq_port = 28335
 peers = ["lapis.erisian.com.au:18353", "tn5.21m.dev:18353"]
 
 # These documentation addresses are examples: replace them before enabling.
+# Miner URLs must use IPv4 addresses; DNS names are not resolved. Entries
+# from older releases that used a DNS name or IPv6 must be changed to the
+# miner's IPv4 literal.
 # [miners.office]
 # name = "Office Bitaxe"
 # url = "http://192.0.2.100"

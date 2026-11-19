@@ -28,6 +28,15 @@ class WalletError(Exception):
         self.status = status
 
 
+# Bitcoin Core reject reasons proving a transaction can never confirm because
+# its inputs are gone; such a transfer must not stay retryable forever.
+SPENT_INPUT_REASONS = ("missing-inputs", "inputs-missingorspent", "mempool-conflict")
+
+# Bitcoin Core's structured "transaction not found" RPC error, as returned by
+# getrawtransaction for a transaction the node does not know.
+TX_NOT_FOUND_CODE = -5
+
+
 class WalletService:
     def __init__(self, root, connect, rpc, genesis, event):
         self.root, self.connect, self.rpc = root, connect, rpc
@@ -37,7 +46,6 @@ class WalletService:
         self.cache = {
             "balance": None,
             "transactions": [],
-            "utxos": [],
             "receive": None,
             "updated_at": None,
         }
@@ -122,7 +130,6 @@ class WalletService:
         self._sync()
         balance = self._cli("balance")
         transactions = self._cli("transactions")["items"]
-        utxos = self._cli("unspent")["items"]
 
         def newest(item):
             position = item.get("chain_position") or {}
@@ -153,7 +160,6 @@ class WalletService:
         self.cache = {
             "balance": balance,
             "transactions": transactions,
-            "utxos": utxos[:100],
             "receive": self._receive(),
             "updated_at": int(time.time()),
         }
@@ -176,7 +182,7 @@ class WalletService:
         data = copy.deepcopy(self.cache)
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT id,status,summary,txid FROM wallet_transfers WHERE status IN ('signed','broadcast') ORDER BY created_at DESC LIMIT 20"
+                "SELECT id,status,summary,txid FROM wallet_transfers WHERE status IN ('signed','broadcast','failed','superseded','abandoned') ORDER BY created_at DESC LIMIT 20"
             ).fetchall()
         data["transfers"] = [
             {**json.loads(row["summary"]), "status": row["status"], "txid": row["txid"]}
@@ -255,6 +261,135 @@ class WalletService:
         change = sum(output.value for output in psbt.tx.vout) - amount
         return psbt, fee, change
 
+    @staticmethod
+    def _mark_terminal(connection, identifier, status, reason, expected):
+        """Compare-and-swap a transfer into a terminal status.
+
+        The row only transitions while it still holds `expected`, so two
+        WalletService processes sharing one database can never both move the
+        same transfer, and a terminal row can never be revived. Terminal
+        transfers never block previews and can never be signed or broadcast
+        again. Returns True when this call performed the transition.
+        """
+        row = connection.execute(
+            "SELECT summary FROM wallet_transfers WHERE id=?", (identifier,)
+        ).fetchone()
+        if row is None:
+            return False
+        summary = {**json.loads(row["summary"]), "reason": reason}
+        cursor = connection.execute(
+            "UPDATE wallet_transfers SET status=?,summary=? WHERE id=? AND status=?",
+            (status, json.dumps(summary), identifier, expected),
+        )
+        return cursor.rowcount == 1
+
+    def _supersede_ready(self, connection, identifier):
+        """Withdraw every other ready draft when one draft is signed.
+
+        Two ready drafts can select the same wallet inputs (two browser
+        tabs). Once one of them is signed, the others must never become a
+        second spend of those inputs. The row guard keeps this safe across
+        processes: only rows that are still ready are withdrawn.
+        """
+        rows = connection.execute(
+            "SELECT id,summary FROM wallet_transfers WHERE status='ready' AND id<>?",
+            (identifier,),
+        ).fetchall()
+        for row in rows:
+            summary = {
+                **json.loads(row["summary"]),
+                "reason": "Another payment was signed first; this preview was withdrawn.",
+            }
+            connection.execute(
+                "UPDATE wallet_transfers SET status='superseded',summary=? "
+                "WHERE id=? AND status='ready'",
+                (json.dumps(summary), row["id"]),
+            )
+
+    def _mempool_rejection(self, raw):
+        """Return the node's reject reason for this raw transaction.
+
+        Returns None when the node accepts the transaction into its mempool.
+        Raises (503) when the node cannot answer, leaving the draft ready:
+        nothing has been broadcast, so guessing either way is unsafe.
+        """
+        try:
+            results = self.rpc("testmempoolaccept", [[raw]])
+        except Exception as error:
+            raise WalletError(
+                "The Bitcoin backend could not pre-check the transaction. Try sending again.",
+                503,
+            ) from error
+        result = results[0] if isinstance(results, list) and len(results) == 1 else None
+        if not isinstance(result, dict):
+            raise WalletError(
+                "The Bitcoin backend returned an unexpected response.", 503
+            )
+        if result.get("allowed") is True:
+            return None
+        return str(result.get("reject-reason") or "transaction not accepted").strip()
+
+    @staticmethod
+    def _inputs_are_gone(error):
+        message = str(error).lower()
+        return any(reason in message for reason in SPENT_INPUT_REASONS)
+
+    @staticmethod
+    def _tx_absent(error):
+        """True only for a definitive node answer that the tx is unknown.
+
+        Bitcoin Core reports a missing transaction as a structured RPC error
+        with code -5. Timeouts, disconnects, auth or backend errors and
+        unstructured exceptions are never treated as proof of absence.
+        """
+        for detail in error.args:
+            if isinstance(detail, dict) and detail.get("code") == TX_NOT_FOUND_CODE:
+                return True
+        return False
+
+    def _found_on_node(self, txid):
+        """Return True when the node knows the exact transaction.
+
+        Absence is only accepted from a structured not-found error; any other
+        failure or a malformed response raises so the transfer stays signed.
+        """
+        try:
+            known = self.rpc("getrawtransaction", [txid, False])
+        except Exception as error:
+            if self._tx_absent(error):
+                return False
+            raise WalletError(
+                "The Bitcoin backend could not confirm whether the transaction "
+                "exists. Try again later; retrying the same transfer stays safe.",
+                503,
+            ) from error
+        if not isinstance(known, str) or not known:
+            raise WalletError(
+                "The Bitcoin backend returned an unexpected response.", 503
+            )
+        try:
+            match = Transaction.parse(bytes.fromhex(known)).txid().hex() == txid
+        except Exception as error:
+            raise WalletError(
+                "The Bitcoin backend returned an unexpected response.", 503
+            ) from error
+        if not match:
+            raise WalletError(
+                "The Bitcoin backend returned an unexpected response.", 503
+            )
+        return True
+
+    def _found_in_wallet(self, txid):
+        """Sync once and look for the transaction in the wallet's history.
+
+        A failed sync raises, so it can never be mistaken for absence: a
+        transaction that already confirmed through the wallet's own backend
+        is reconciled instead of abandoned.
+        """
+        self._sync()
+        items = self._cli("transactions")["items"]
+        return any(item.get("txid") == txid for item in items)
+
     def preview(self, data):
         address, amount, fee_rate, output_script = self.validate_payment(data)
         with self.lock:
@@ -291,13 +426,26 @@ class WalletService:
             }
             with self.connect() as connection:
                 connection.execute(
-                    "DELETE FROM wallet_transfers WHERE status='ready' AND expires_at < ?",
+                    "DELETE FROM wallet_transfers WHERE expires_at < ? AND status IN ('ready','failed','superseded','abandoned')",
                     (now,),
                 )
-                connection.execute(
-                    "INSERT INTO wallet_transfers VALUES (?,?,?,'ready',?,?,NULL,NULL)",
+                # Insert atomically only while no signed transfer exists:
+                # another process can sign between the check above and this
+                # insert, and a ready draft created after that could become a
+                # second spend of the same inputs. If signing commits first
+                # this insert matches zero rows; if this insert commits first,
+                # signing's supersede step withdraws the new draft.
+                cursor = connection.execute(
+                    "INSERT INTO wallet_transfers "
+                    "SELECT ?,?,?,'ready',?,?,NULL,NULL "
+                    "WHERE NOT EXISTS (SELECT 1 FROM wallet_transfers WHERE status='signed')",
                     (identifier, now, now + 600, json.dumps(summary), encoded),
                 )
+                if cursor.rowcount != 1:
+                    raise WalletError(
+                        "Resolve the saved pending transfer before creating another payment.",
+                        409,
+                    )
             return summary
 
     def send(self, data):
@@ -321,6 +469,12 @@ class WalletService:
                     "status": "broadcast",
                     "draft_id": identifier,
                 }
+            if row["status"] != "ready" and row["status"] != "signed":
+                # failed, superseded and abandoned are terminal: they can
+                # never be signed or broadcast again.
+                raise WalletError(
+                    "This transfer is no longer usable. Create a new preview.", 409
+                )
             if row["status"] == "ready" and row["expires_at"] < time.time():
                 raise WalletError("This preview expired. Create a new preview.", 409)
             self._check_chain()
@@ -348,12 +502,58 @@ class WalletService:
                     raise WalletError(
                         "Signed transaction identity differs from the preview.", 503
                     )
+                rejection = self._mempool_rejection(raw)
+                # A reject reason mentioning "already" (txn-already-in-mempool)
+                # means this exact transaction may already be live; failing the
+                # draft could invite a second payment, so let the broadcast
+                # attempt below confirm it instead.
+                if rejection is not None and "already" not in rejection.lower():
+                    # The node refuses this exact transaction, so it can never
+                    # broadcast. Fail the draft before saving retryable signed
+                    # bytes so previews stay unblocked.
+                    logging.warning(
+                        "Wallet transfer %s rejected by the node: %s",
+                        identifier,
+                        rejection,
+                    )
+                    with self.connect() as connection:
+                        transitioned = self._mark_terminal(
+                            connection,
+                            identifier,
+                            "failed",
+                            f"The node rejected the transaction: {rejection}.",
+                            "ready",
+                        )
+                    if transitioned:
+                        raise WalletError(
+                            f"The node rejected the transaction ({rejection}). "
+                            "Create a new preview.",
+                            409,
+                        )
+                    # Another process moved this draft first; do not report a
+                    # rejection that no longer applies to it.
+                    raise WalletError(
+                        "This preview was already sent or withdrawn. Create a new preview.",
+                        409,
+                    )
                 # Save the exact signed bytes before broadcasting so retries cannot build a second payment.
                 with self.connect() as connection:
-                    connection.execute(
-                        "UPDATE wallet_transfers SET status='signed',raw_tx=?,txid=? WHERE id=?",
+                    # Compare-and-swap: only the first process to move this
+                    # draft from ready to signed may broadcast it.
+                    cursor = connection.execute(
+                        "UPDATE wallet_transfers SET status='signed',raw_tx=?,txid=? "
+                        "WHERE id=? AND status='ready'",
                         (raw, txid, identifier),
                     )
+                    if cursor.rowcount != 1:
+                        raise WalletError(
+                            "This preview was already sent or withdrawn. "
+                            "Create a new preview.",
+                            409,
+                        )
+                    # Competing ready drafts may spend the same inputs and must
+                    # never become a second signed transaction.
+                    self._supersede_ready(connection, identifier)
             try:
                 result = self.rpc("sendrawtransaction", [raw])
                 if result != txid:
@@ -364,17 +564,162 @@ class WalletService:
                     if Transaction.parse(bytes.fromhex(known)).txid().hex() != txid:
                         raise ValueError("Transaction not found")
                 except Exception:
+                    if self._inputs_are_gone(error):
+                        # The node reports the inputs as missing or already
+                        # spent, so this transaction can never confirm. Keep it
+                        # terminal instead of retryable forever.
+                        logging.warning(
+                            "Wallet transfer %s inputs missing or spent: %s",
+                            identifier,
+                            error,
+                        )
+                        with self.connect() as connection:
+                            self._mark_terminal(
+                                connection,
+                                identifier,
+                                "failed",
+                                "The transaction's inputs are missing or already spent.",
+                                "signed",
+                            )
+                        raise WalletError(
+                            "The transaction's inputs are missing or already spent; "
+                            "the transfer was discarded. Create a new preview.",
+                            409,
+                        ) from error
                     raise WalletError(
                         "Broadcast could not be confirmed. The transfer is saved; retry this same transfer instead of creating another payment.",
                         503,
                     ) from error
             with self.connect() as connection:
-                connection.execute(
-                    "UPDATE wallet_transfers SET status='broadcast' WHERE id=?",
+                # Compare-and-swap: never overwrite a status another process
+                # resolved while the broadcast was in flight.
+                cursor = connection.execute(
+                    "UPDATE wallet_transfers SET status='broadcast' "
+                    "WHERE id=? AND status='signed'",
                     (identifier,),
                 )
+                if cursor.rowcount != 1:
+                    resolved = connection.execute(
+                        "SELECT status,txid FROM wallet_transfers WHERE id=?",
+                        (identifier,),
+                    ).fetchone()
+                    if (
+                        resolved is not None
+                        and resolved["status"] == "broadcast"
+                        and resolved["txid"] == txid
+                    ):
+                        return {
+                            "txid": txid,
+                            "status": "broadcast",
+                            "draft_id": identifier,
+                        }
+                    raise WalletError(
+                        "This transfer was already resolved otherwise. "
+                        "Check the wallet before creating a new preview.",
+                        409,
+                    )
             self.event(
                 "info",
                 f"Testnet5 wallet sent {summary['amount_sat']} sats; transaction {txid}",
             )
             return {"txid": txid, "status": "broadcast", "draft_id": identifier}
+
+    def abandon(self, data):
+        """Operator recovery for a signed transfer that cannot broadcast.
+
+        Only a saved (signed) transfer can be abandoned, only with an
+        explicit confirmation, and only when neither the node nor the
+        wallet's own backend knows its transaction; if either has it, the
+        transfer is reconciled to broadcast instead. Abandoning is terminal:
+        the saved bytes can never be broadcast again and the operator is
+        responsible for the risk that the absent transaction later
+        propagates.
+        """
+        identifier = data.get("draft_id")
+        if not isinstance(identifier, str) or not re.fullmatch(
+            r"[A-Za-z0-9_-]{32}", identifier
+        ):
+            raise WalletError("Create a payment preview first.")
+        if data.get("confirmed") is not True:
+            raise WalletError(
+                "Abandoning is irreversible; confirm that the saved transfer "
+                "should be discarded and that its transaction is not propagating.",
+                400,
+            )
+        with self.lock:
+            with self.connect() as connection:
+                row = connection.execute(
+                    "SELECT * FROM wallet_transfers WHERE id=?", (identifier,)
+                ).fetchone()
+            if row is None:
+                raise WalletError(
+                    "Payment preview not found. Create a new preview.", 404
+                )
+            if row["status"] != "signed":
+                raise WalletError(
+                    "Only a saved transfer awaiting broadcast can be abandoned.", 409
+                )
+            self._check_chain()
+            txid = row["txid"]
+            if self._found_on_node(txid) or self._found_in_wallet(txid):
+                # The transaction is live: never abandon a payment that may
+                # already be propagating. Reconcile with a compare-and-swap
+                # so a concurrent resolution is never overwritten or double
+                # reported.
+                reconciled = False
+                with self.connect() as connection:
+                    cursor = connection.execute(
+                        "UPDATE wallet_transfers SET status='broadcast' "
+                        "WHERE id=? AND status='signed'",
+                        (identifier,),
+                    )
+                    if cursor.rowcount == 1:
+                        reconciled = True
+                    else:
+                        resolved = connection.execute(
+                            "SELECT status,txid FROM wallet_transfers WHERE id=?",
+                            (identifier,),
+                        ).fetchone()
+                        if not (
+                            resolved is not None
+                            and resolved["status"] == "broadcast"
+                            and resolved["txid"] == txid
+                        ):
+                            raise WalletError(
+                                "This transfer was already resolved otherwise. "
+                                "Check the wallet before creating a new preview.",
+                                409,
+                            )
+                # The connection context has exited and the update is committed
+                # before this runs: the event callback opens its own database
+                # connection and must never block on our write lock.
+                if reconciled:
+                    self.event(
+                        "info",
+                        f"Testnet5 wallet transaction {txid} found on the node; "
+                        "transfer marked broadcast.",
+                    )
+                raise WalletError(
+                    "The node already has this transaction; the transfer was "
+                    "marked broadcast and stays safe to retry.",
+                    409,
+                )
+            logging.warning("Wallet transfer %s abandoned by operator", identifier)
+            with self.connect() as connection:
+                transitioned = self._mark_terminal(
+                    connection,
+                    identifier,
+                    "abandoned",
+                    "Abandoned by the operator after broadcast could not be confirmed; "
+                    "the transaction was not known to the node.",
+                    "signed",
+                )
+            if not transitioned:
+                raise WalletError(
+                    "This transfer was already resolved. Create a new preview.", 409
+                )
+            self.event(
+                "info",
+                "A saved testnet5 wallet transfer was abandoned by the operator.",
+            )
+            return {"draft_id": identifier, "status": "abandoned"}

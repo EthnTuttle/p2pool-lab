@@ -18,16 +18,24 @@ import subprocess
 import threading
 import time
 from urllib.parse import parse_qs, urlsplit
-from urllib.request import ProxyHandler, Request, build_opener
+from urllib.request import Request
 
 from .wallet_api import WalletError, WalletService
 from .config import GENESIS, load
-from .devices import DeviceRegistry, NoRedirect, fleet_summary
+from .devices import (
+    DeviceRegistry,
+    deadline_opener,
+    fleet_summary,
+    finite_number,
+    open_response,
+    read_response,
+    safe_text,
+)
 
 CONFIG = load()
 ROOT = CONFIG.state_dir
 STATIC = Path(__file__).resolve().parent / "static"
-HOST = CONFIG.bind_host
+HOST = getattr(CONFIG, "dashboard_host", getattr(CONFIG, "bind_host", "127.0.0.1"))
 PORT = CONFIG.dashboard_port
 ORIGIN = CONFIG.origin
 MINERS = CONFIG.miners
@@ -137,33 +145,41 @@ NUMERIC_FIELDS = frozenset(
         "workReceived",
     }
 )
-OPENER = build_opener(ProxyHandler({}), NoRedirect())
-SQLITE_INT_MIN, SQLITE_INT_MAX = -(2**63), 2**63 - 1
+FLAG_FIELDS = frozenset({"autofanspeed", "overheat_mode", "stratumTLS"})
+BOOLEAN_FIELDS = frozenset({"isUsingFallbackStratum", "miningPaused"})
+STRING_FIELDS = (
+    frozenset(MINER_FIELDS)
+    - NUMERIC_FIELDS
+    - FLAG_FIELDS
+    - BOOLEAN_FIELDS
+    - {"pool_config_format", "supported_actions"}
+)
+OPENER = deadline_opener()
+REQUEST_TIMEOUT = 4
+COLLECTION_GRACE = 1
 
 
-def finite_number(value):
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    if isinstance(value, int):
-        return value if SQLITE_INT_MIN <= value <= SQLITE_INT_MAX else None
-    try:
-        return value if math.isfinite(value) else None
-    except OverflowError:
-        return None
-
-
-def request(url, method="GET", data=None, headers=None, text=False):
+def request(
+    url, method="GET", data=None, headers=None, text=False, timeout=REQUEST_TIMEOUT
+):
     headers = dict(headers or {})
     if data is not None:
         headers["Content-Type"] = "application/json"
     payload = None if data is None else json.dumps(data).encode()
-    with OPENER.open(
-        Request(url, data=payload, headers=headers, method=method), timeout=4
-    ) as response:
-        if text:
-            return response.read().decode()
-        body = response.read(4 * 1024 * 1024).decode()
-    return json.loads(body) if body.strip() else {}
+    deadline = time.monotonic() + timeout
+    outbound = Request(url, data=payload, headers=headers, method=method)
+    with open_response(OPENER, outbound, timeout, deadline) as response:
+        body = read_response(response, deadline, 4 * 1024 * 1024).decode()
+    return body if text else json.loads(body) if body.strip() else {}
+
+
+def pool_request(url, text=False):
+    headers = dict(getattr(CONFIG, "pool_auth_headers", {}) or {})
+    return request(url, headers=headers, text=text)
+
+
+def clean_history(rows):
+    return [{key: finite_number(value) for key, value in row.items()} for row in rows]
 
 
 def payout_window(height):
@@ -236,30 +252,44 @@ def bitcoin_status():
 
 def miner_status(miner_id, url=None):
     info = request((url or MINERS[miner_id]["url"]) + "/api/system/info")
-    for key, value in list(info.items()):
-        if isinstance(value, float) and not math.isfinite(value):
-            info[key] = None
-    info["pool_config_format"] = (
-        "array" if isinstance(info.get("pools"), list) else "legacy"
-    )
-    version_text = info.get("version")
+    if not isinstance(info, dict):
+        raise ValueError("AxeOS returned invalid system information")
+    pool_config_format = "array" if isinstance(info.get("pools"), list) else "legacy"
+    version_text = safe_text(info.get("version"), 64)
     version = (
         re.search(r"(\d+)\.(\d+)\.(\d+)", version_text)
-        if isinstance(version_text, str)
+        if version_text is not None
         else None
     )
     modern = version and tuple(map(int, version.groups())) >= (2, 14, 0)
-    info["supported_actions"] = sorted(
-        ACTIONS if modern else {"restart", "configure-pool"}
-    )
+    cleaned = {
+        "pool_config_format": pool_config_format,
+        "supported_actions": sorted(
+            ACTIONS if modern else {"restart", "configure-pool"}
+        ),
+    }
     for field in NUMERIC_FIELDS:
         if field in info:
-            info[field] = finite_number(info[field])
+            cleaned[field] = finite_number(info[field])
+    for field in STRING_FIELDS:
+        if field in info:
+            cleaned[field] = safe_text(info[field], 64 if field == "version" else 256)
+    for field in FLAG_FIELDS | BOOLEAN_FIELDS:
+        if field in info:
+            value = info[field]
+            if isinstance(value, bool):
+                cleaned[field] = value
+            else:
+                number = finite_number(value)
+                cleaned[field] = number if number in (0, 1) else None
+    for field in BOOLEAN_FIELDS:
+        if cleaned.get(field) is not None:
+            cleaned[field] = bool(cleaned[field])
     for field in ("temp", "temp2", "vrTemp"):
-        value = info.get(field)
+        value = cleaned.get(field)
         if value is not None and value < 0:
-            info[field] = None
-    return {key: info[key] for key in MINER_FIELDS if key in info}
+            cleaned[field] = None
+    return {key: cleaned[key] for key in MINER_FIELDS if key in cleaned}
 
 
 def parse_metrics(text, payout_address):
@@ -273,8 +303,14 @@ def parse_metrics(text, payout_address):
             if math.isfinite(value):
                 values[match[1]] = value
         if line.startswith("bitcoin_block_found_time_seconds{"):
+            try:
+                timestamp = finite_number(float(line.rsplit(" ", 1)[1]))
+            except (ValueError, OverflowError):
+                continue
+            if timestamp is None:
+                continue
             labels = dict(re.findall(r'(\w+)="([^"\\]*)"', line))
-            labels["timestamp"] = float(line.rsplit(" ", 1)[1])
+            labels["timestamp"] = timestamp
             blocks.append(labels)
     # An incomplete metrics response must not look like a lower block count.
     lab_blocks_found = None
@@ -299,10 +335,11 @@ def build_alerts(sources, miners=None):
     alerts = []
     for name, source in sources.items():
         if not source["ok"]:
+            error = safe_text(str(source.get("error")), 512) or "Unknown error"
             alerts.append(
                 {
                     "level": "warning",
-                    "message": f"{name.title()} unavailable: {source['error']}",
+                    "message": f"{name.title()} unavailable: {error}",
                 }
             )
     for miner_id in MINERS if miners is None else miners:
@@ -358,7 +395,13 @@ def build_alerts(sources, miners=None):
         alerts.append(
             {"level": "warning", "message": "rbitcoin is still synchronizing."}
         )
-    return alerts
+    return [
+        {
+            **alert,
+            "message": safe_text(alert["message"], 1024) or "Miner status alert",
+        }
+        for alert in alerts
+    ]
 
 
 class Monitor:
@@ -367,6 +410,8 @@ class Monitor:
         self.lock = threading.Lock()
         self.action_lock = threading.Lock()
         self.owner_history_lock = threading.Lock()
+        self.executor = ThreadPoolExecutor(max_workers=6)
+        self.loader_futures = {}
         self.owner_history_tip = None
         self.owner_history_heights = []
         self.token = secrets.token_urlsafe(32)
@@ -407,10 +452,16 @@ class Monitor:
             connection.close()
 
     def event(self, level, message):
+        level = safe_text(level, 32) if isinstance(level, str) else "info"
+        message = (
+            safe_text(message, 1024)
+            if isinstance(message, str)
+            else "Event message unavailable"
+        )
         with self.connect() as connection:
             connection.execute(
                 "INSERT INTO events(timestamp,level,message) VALUES (?,?,?)",
-                (int(time.time()), level, message),
+                (int(time.time()), level or "info", message or "No details"),
             )
             connection.execute(
                 "DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT 500)"
@@ -473,13 +524,15 @@ class Monitor:
         owner = self.settings["share_owner_address"]
         shares_url = f"{POOL}/shares"
         with self.owner_history_lock:
-            tip = request(f"{shares_url}?num=1")["shares"][0]
+            tip = pool_request(f"{shares_url}?num=1")["shares"][0]
             start = 0
             heights = []
             if self.owner_history_tip:
                 previous = self.owner_history_tip
                 if previous["height"] <= tip["height"]:
-                    checkpoint = request(f"{shares_url}?num=1&to={previous['height']}")
+                    checkpoint = pool_request(
+                        f"{shares_url}?num=1&to={previous['height']}"
+                    )
                     if checkpoint["shares"][0]["blockhash"] == previous["blockhash"]:
                         start = previous["height"] + 1
                         heights = self.owner_history_heights.copy()
@@ -487,7 +540,7 @@ class Monitor:
             end = tip["height"]
             while end >= start:
                 count = min(SHARE_BATCH_SIZE, end - start + 1)
-                batch = request(f"{shares_url}?num={count}&to={end}")
+                batch = pool_request(f"{shares_url}?num={count}&to={end}")
                 if batch["to_height"] != end or len(batch["shares"]) != count:
                     raise RuntimeError("Share history changed while loading")
                 for share in batch["shares"]:
@@ -498,7 +551,7 @@ class Monitor:
                         heights.append(share["height"])
                 end = batch["from_height"] - 1
 
-            checkpoint = request(f"{shares_url}?num=1&to={tip['height']}")
+            checkpoint = pool_request(f"{shares_url}?num=1&to={tip['height']}")
             if checkpoint["shares"][0]["blockhash"] != tip["blockhash"]:
                 raise RuntimeError("Share history changed while loading")
             self.owner_history_tip = tip
@@ -511,10 +564,10 @@ class Monitor:
     def owner_shares(self, to_height):
         owner = self.settings["share_owner_address"]
         shares_url = f"{POOL}/shares?num={SHARE_BATCH_SIZE}"
-        latest = request(shares_url)
+        latest = pool_request(shares_url)
         payout_inputs = None
         try:
-            chain = request(POOL + "/chain_info")
+            chain = pool_request(POOL + "/chain_info")
             template = bitcoin_rpc(
                 "getblocktemplate", [{"rules": ["segwit", "consensuscleanup"]}]
             )
@@ -529,7 +582,9 @@ class Monitor:
         newest_height = None
         for _ in range(SHARE_PAGE_BATCHES):
             batch = (
-                latest if to_height is None else request(f"{shares_url}&to={to_height}")
+                latest
+                if to_height is None
+                else pool_request(f"{shares_url}&to={to_height}")
             )
             if newest_height is None:
                 newest_height = batch["to_height"]
@@ -581,10 +636,10 @@ class Monitor:
         miners = self.registry.devices()
         loaders = {
             "bitcoin": bitcoin_status,
-            "chain": lambda: request(POOL + "/chain_info"),
-            "peers": lambda: request(POOL + "/peers"),
+            "chain": lambda: pool_request(POOL + "/chain_info"),
+            "peers": lambda: pool_request(POOL + "/peers"),
             "metrics": lambda: parse_metrics(
-                request(POOL + "/metrics", text=True),
+                pool_request(POOL + "/metrics", text=True),
                 self.settings["bitcoin_payout_address"],
             ),
         }
@@ -600,36 +655,59 @@ class Monitor:
             for key, value in sources.items()
             if not key.startswith("miner-") or key[6:] in miners
         }
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            futures = {
-                name: executor.submit(loader) for name, loader in loaders.items()
-            }
-            for name, future in futures.items():
-                attempted = time.time()
-                try:
-                    sources[name] = {
-                        "ok": True,
-                        "data": future.result(),
-                        "updated_at": time.time(),
-                        "attempted_at": attempted,
-                        "error": None,
-                    }
-                except Exception as error:
-                    previous = sources.get(name, {})
-                    sources[name] = {
-                        "ok": False,
-                        "data": previous.get("data"),
-                        "updated_at": previous.get("updated_at"),
-                        "attempted_at": attempted,
-                        "error": str(error),
-                    }
+        # Keep at most one outstanding job per source. A wedged loader retains
+        # its slot and is not resubmitted, so recurring cycles cannot grow the
+        # pool or queue even though arbitrary Python code cannot be killed.
+        active_names = set(loaders)
+        for name, future in list(self.loader_futures.items()):
+            if name not in active_names:
+                future.cancel()
+                if future.done():
+                    del self.loader_futures[name]
+        futures = {}
+        deadline = time.monotonic() + REQUEST_TIMEOUT + COLLECTION_GRACE
+        for name, loader in loaders.items():
+            future = self.loader_futures.get(name)
+            if future is None or future.done():
+                future = self.executor.submit(loader)
+                self.loader_futures[name] = future
+            futures[name] = future
+        for name, future in futures.items():
+            attempted = time.time()
+            try:
+                data = future.result(timeout=max(0, deadline - time.monotonic()))
+                sources[name] = {
+                    "ok": True,
+                    "data": data,
+                    "updated_at": time.time(),
+                    "attempted_at": attempted,
+                    "error": None,
+                }
+            except Exception as error:
+                future.cancel()
+                previous = sources.get(name, {})
+                message = safe_text(str(error), 512) or type(error).__name__
+                sources[name] = {
+                    "ok": False,
+                    "data": previous.get("data"),
+                    "updated_at": previous.get("updated_at"),
+                    "attempted_at": attempted,
+                    "error": message,
+                }
         alerts = build_alerts(sources, miners)
+
+        def store_event(level, message):
+            try:
+                self.event(level, message)
+            except Exception:
+                logging.warning("Could not store dashboard event", exc_info=True)
+
         for alert in alerts:
             if alert not in old_alerts:
-                self.event(alert["level"], alert["message"])
+                store_event(alert["level"], alert["message"])
         for alert in old_alerts:
             if alert not in alerts:
-                self.event("info", "Cleared: " + alert["message"])
+                store_event("info", "Cleared: " + alert["message"])
         timestamp = int(time.time())
         bitcoin = sources["bitcoin"]["data"] if sources["bitcoin"]["ok"] else {}
         chain = sources["chain"]["data"] if sources["chain"]["ok"] else {}
@@ -690,7 +768,7 @@ class Monitor:
         since = int(time.time() - hours * 3600)
         with self.connect() as connection:
             if miner_id == "fleet":
-                return [
+                return clean_history(
                     dict(row)
                     for row in connection.execute(
                         """
@@ -706,8 +784,8 @@ class Monitor:
                 """,
                         (since, step),
                     )
-                ]
-            return [
+                )
+            return clean_history(
                 dict(row)
                 for row in connection.execute(
                     """
@@ -719,7 +797,7 @@ class Monitor:
             """,
                     (miner_id, since, step),
                 )
-            ]
+            )
 
     def action(self, miner_id, action):
         miners = self.registry.devices()
@@ -828,8 +906,9 @@ class Handler(BaseHTTPRequestHandler):
         self.connection.settimeout(10)
 
     def log_message(self, format, *args):
-        if args and str(args[1]) not in ("200", "304"):
-            logging.info(format, *args)
+        if len(args) > 1 and str(args[1]) in ("200", "304"):
+            return
+        logging.info(format, *args)
 
     def reply(self, value, status=200, content_type="application/json"):
         body = (
@@ -861,6 +940,13 @@ class Handler(BaseHTTPRequestHandler):
         if not self.valid_host():
             return self.reply({"error": "Unrecognized dashboard host"}, 403)
         path = urlsplit(self.path)
+        fetch_site = self.headers.get("Sec-Fetch-Site")
+        if path.path.startswith("/api/") and fetch_site not in (
+            None,
+            "same-origin",
+            "none",
+        ):
+            return self.reply({"error": "Cross-site dashboard read rejected"}, 403)
         try:
             if path.path == "/api/state":
                 return self.reply(self.server.monitor.snapshot())
@@ -941,7 +1027,10 @@ class Handler(BaseHTTPRequestHandler):
             not self.valid_host()
             or self.headers.get("Origin") != "http://" + self.headers.get("Host", "")
             or not secrets.compare_digest(
-                self.headers.get("X-Dashboard-Token", ""), self.server.monitor.token
+                self.headers.get("X-Dashboard-Token", "").encode(
+                    "utf-8", errors="replace"
+                ),
+                self.server.monitor.token.encode("utf-8", errors="replace"),
             )
         ):
             return self.reply(
@@ -954,6 +1043,7 @@ class Handler(BaseHTTPRequestHandler):
             ),
             "/api/wallet/preview": self.server.monitor.wallet.preview,
             "/api/wallet/send": self.server.monitor.wallet.send,
+            "/api/wallet/abandon": self.server.monitor.wallet.abandon,
             "/api/devices/discover": lambda data: self.server.monitor.registry.discover(
                 data.get("cidr")
             ),

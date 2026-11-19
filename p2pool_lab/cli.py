@@ -11,7 +11,7 @@ import sys
 import time
 
 from .config import GENESIS, load
-from .runtime import initialize, private_write
+from .runtime import ensure_runtime_config, initialize, private_write
 
 COMPONENTS = ("bitcoin", "pool", "hashblock", "dashboard")
 
@@ -165,6 +165,10 @@ def main():
             )
         if not (config.state_dir / "miner-settings.json").exists():
             raise RuntimeError("Run init first")
+        if args.command in ("pool", "run", "dashboard", "status"):
+            # Upgrade path: refresh the rendered pool config (adding API
+            # authentication to older state dirs) before the pool can start.
+            ensure_runtime_config(config)
         if args.command in ("bitcoin", "pool"):
             command = component_command(config, args.command)
             os.execvp(command[0], command)
@@ -187,7 +191,10 @@ def main():
                 json.dumps(
                     {
                         "bitcoin": bitcoin_status(),
-                        "pool": request(config.pool_url + "/chain_info"),
+                        "pool": request(
+                            config.pool_url + "/chain_info",
+                            headers=config.pool_auth_headers,
+                        ),
                         "dashboard": config.origin,
                     },
                     indent=2,

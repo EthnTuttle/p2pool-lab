@@ -1,5 +1,6 @@
 """Verify data loss handling and that device controls stay narrow and same-origin."""
 
+import copy
 import http.client
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -8,6 +9,7 @@ from pathlib import Path
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -33,11 +35,14 @@ class DashboardTests(unittest.TestCase):
         root_patch.start()
         self.addCleanup(root_patch.stop)
         configuration = replace(
-            server.CONFIG, bind_host="192.0.2.1", public_host="192.0.2.1"
+            server.CONFIG,
+            bind_host="192.0.2.1",
+            dashboard_host="192.0.2.1",
+            public_host="192.0.2.1",
         )
         for attribute, value in (
             ("CONFIG", configuration),
-            ("HOST", configuration.bind_host),
+            ("HOST", configuration.dashboard_host),
             ("ORIGIN", configuration.origin),
         ):
             configuration_patch = patch.object(server, attribute, value)
@@ -62,6 +67,7 @@ class DashboardTests(unittest.TestCase):
         miners_patch.start()
         self.addCleanup(miners_patch.stop)
         self.monitor = server.Monitor(self.root / "history.sqlite")
+        self.addCleanup(self.monitor.executor.shutdown, wait=False, cancel_futures=True)
 
     def test_configuration_only_changes_pool_fields_and_does_not_restart(self):
         original = {
@@ -175,6 +181,11 @@ class DashboardTests(unittest.TestCase):
             patch.object(
                 server, "bitcoin_rpc", return_value={"coinbasevalue": 6048000}
             ),
+            patch.object(
+                server,
+                "CONFIG",
+                SimpleNamespace(pool_auth_headers={"Authorization": "Basic pool-test"}),
+            ),
         ):
             page = self.monitor.owner_shares(199)
 
@@ -194,6 +205,10 @@ class DashboardTests(unittest.TestCase):
                 "shares?num=100&to=99",
             ],
         )
+        for call in request.call_args_list:
+            self.assertEqual(
+                call.kwargs["headers"], {"Authorization": "Basic pool-test"}
+            )
         self.assertEqual(
             [share["payout_from_height"] for share in page["shares"]], [151, 106]
         )
@@ -209,7 +224,7 @@ class DashboardTests(unittest.TestCase):
         owned = {25, 1460}
         revision = 0
 
-        def fetch(url):
+        def fetch(url, **kwargs):
             query = parse_qs(urlsplit(url).query)
             end = min(tip, int(query.get("to", [tip])[0]))
             start = max(0, end - int(query["num"][0]) + 1)
@@ -227,7 +242,14 @@ class DashboardTests(unittest.TestCase):
                 ],
             }
 
-        with patch.object(server, "request", side_effect=fetch) as request:
+        with (
+            patch.object(server, "request", side_effect=fetch) as request,
+            patch.object(
+                server,
+                "CONFIG",
+                SimpleNamespace(pool_auth_headers={"Authorization": "Basic pool-test"}),
+            ),
+        ):
             self.assertEqual(self.monitor.owner_share_pages(), [1500, 500])
             request.reset_mock()
             tip = 1501
@@ -239,6 +261,10 @@ class DashboardTests(unittest.TestCase):
             revision = 2
             owned = set()
             self.assertEqual(self.monitor.owner_share_pages(), [])
+            for call in request.call_args_list:
+                self.assertEqual(
+                    call.kwargs["headers"], {"Authorization": "Basic pool-test"}
+                )
 
     def test_share_payout_window_and_recent_pace(self):
         self.assertEqual(server.payout_window(33_037), (39_085, 160_044))
@@ -327,6 +353,77 @@ class DashboardTests(unittest.TestCase):
             self.monitor.snapshot()["sources"]["miner-110"]["data"]["hashRate"], 900
         )
 
+    def test_collect_uses_bounded_future_wait_and_isolates_event_failures(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def pool_data(url, **kwargs):
+            if url.endswith("peers"):
+                return []
+            if url.endswith("metrics"):
+                return ""
+            return {"chain_tip_height": 20}
+
+        with (
+            patch.object(self.monitor.registry, "devices", return_value={}),
+            patch.object(server, "pool_request", side_effect=pool_data),
+            patch.object(server, "bitcoin_status", side_effect=release.wait) as bitcoin,
+            patch.object(server, "REQUEST_TIMEOUT", 0.01),
+            patch.object(server, "COLLECTION_GRACE", 0.01),
+        ):
+            started = time.monotonic()
+            self.monitor.collect()
+            self.monitor.collect()
+            workers_after_warmup = len(self.monitor.executor._threads)
+            self.monitor.collect()
+            self.monitor.collect()
+            elapsed = time.monotonic() - started
+            self.assertEqual(len(self.monitor.executor._threads), workers_after_warmup)
+            bitcoin.assert_called_once_with()
+        release.set()
+        for future in self.monitor.loader_futures.values():
+            future.result(timeout=1)
+        self.assertLess(elapsed, 1)
+        self.assertFalse(self.monitor.state["sources"]["bitcoin"]["ok"])
+        self.assertIsNotNone(self.monitor.state["updated_at"])
+        self.monitor.state["alerts"] = []
+
+        with (
+            patch.object(self.monitor.registry, "devices", return_value={}),
+            patch.object(server, "pool_request", side_effect=pool_data),
+            patch.object(server, "bitcoin_status", side_effect=RuntimeError("offline")),
+            patch.object(
+                self.monitor,
+                "event",
+                side_effect=UnicodeEncodeError("utf-8", "\ud800", 0, 1, "bad"),
+            ) as event,
+        ):
+            with self.assertLogs(level="WARNING"):
+                self.monitor.collect()
+        event.assert_called()
+        self.assertIsNotNone(self.monitor.state["updated_at"])
+
+    def test_collect_pool_requests_include_configured_auth_headers(self):
+        headers = {"Authorization": "Basic pool-test"}
+
+        def fetch(url, **kwargs):
+            if url.endswith("chain_info"):
+                return {"chain_tip_height": 20}
+            if url.endswith("peers"):
+                return []
+            return "shares_accepted_total 0\n"
+
+        with (
+            patch.object(self.monitor.registry, "devices", return_value={}),
+            patch.object(server, "bitcoin_status", return_value={"blocks": 50}),
+            patch.object(server, "CONFIG", SimpleNamespace(pool_auth_headers=headers)),
+            patch.object(server, "request", side_effect=fetch) as request,
+        ):
+            self.monitor.collect()
+        self.assertEqual(request.call_count, 3)
+        for call in request.call_args_list:
+            self.assertEqual(call.kwargs["headers"], headers)
+
     def test_badly_typed_miner_fields_do_not_stop_the_collection_cycle(self):
         def fetch(url, **kwargs):
             if url.endswith("chain_info"):
@@ -374,7 +471,7 @@ class DashboardTests(unittest.TestCase):
         self.assertIsNone(malformed["temp"])
         self.assertIsNone(malformed["power"])
         self.assertIsNone(malformed["coreVoltageActual"])
-        self.assertEqual(malformed["poolConnectionInfo"], [])
+        self.assertIsNone(malformed["poolConnectionInfo"])
         with self.monitor.connect() as connection:
             rows = {
                 row["miner"]: row["hashrate"]
@@ -435,6 +532,96 @@ class DashboardTests(unittest.TestCase):
         self.assertIsNone(server.finite_number(True))
         self.assertEqual(server.finite_number(0), 0)
 
+    def test_miner_schema_neutralizes_hostile_values_and_deep_containers(self):
+        nested = current = []
+        for _ in range(2000):
+            child = []
+            current.append(child)
+            current = child
+        with patch.object(
+            server,
+            "request",
+            return_value={
+                "hostname": [float("nan")],
+                "hashRate": 1.7e308,
+                "power": float("inf"),
+                "temp": float("nan"),
+                "power_fault": "\ud800",
+                "poolConnectionInfo": 1,
+                "sharesRejectedReasons": nested,
+                "stratumURL": "x" * 1000,
+                "miningPaused": "false",
+                "overheat_mode": [1],
+                "autofanspeed": 1,
+                "ASICModel": 1370,
+                "stratumPassword": "must not escape",
+            },
+        ):
+            info = server.miner_status("100")
+
+        self.assertIsNone(info["hostname"])
+        self.assertIsNone(info["hashRate"])
+        self.assertIsNone(info["power"])
+        self.assertIsNone(info["temp"])
+        self.assertIsNone(info["poolConnectionInfo"])
+        self.assertIsNone(info["sharesRejectedReasons"])
+        self.assertIsNone(info["miningPaused"])
+        self.assertIsNone(info["overheat_mode"])
+        self.assertIsNone(info["ASICModel"])
+        self.assertEqual(info["autofanspeed"], 1)
+        self.assertEqual(info["power_fault"], "?")
+        self.assertEqual(len(info["stratumURL"]), 256)
+        self.assertNotIn("stratumPassword", info)
+        json.dumps(copy.deepcopy(info), allow_nan=False).encode("utf-8")
+
+    def test_extreme_telemetry_cannot_poison_state_history_or_events(self):
+        def fetch(url, **kwargs):
+            if url.endswith("chain_info"):
+                return {"chain_tip_height": 20}
+            if url.endswith("peers"):
+                return []
+            if url.endswith("/api/system/info"):
+                return {
+                    "hashRate": 1.7e308,
+                    "power": 1.7e308,
+                    "temp": 55,
+                    "power_fault": "\ud800",
+                }
+            return "shares_accepted_total 0\n"
+
+        with (
+            patch.object(server, "request", side_effect=fetch),
+            patch.object(server, "bitcoin_status", return_value={"blocks": 50}),
+        ):
+            self.monitor.collect()
+
+        state = self.monitor.snapshot()
+        self.assertIsNone(state["sources"]["miner-100"]["data"]["hashRate"])
+        self.assertIsNone(state["fleet"]["hashRate"])
+        json.dumps(state, allow_nan=False).encode("utf-8")
+        json.dumps(self.monitor.history(1, "fleet"), allow_nan=False).encode("utf-8")
+        with self.monitor.connect() as connection:
+            message = connection.execute(
+                "SELECT message FROM events ORDER BY id DESC LIMIT 1"
+            ).fetchone()["message"]
+        message.encode("utf-8")
+        self.assertIn("Bitaxe .", message)
+        self.assertIn("?", message)
+
+    def test_finite_number_rejects_float_magnitudes_beyond_telemetry_bounds(self):
+        self.assertEqual(server.finite_number(1e15), 1e15)
+        self.assertEqual(server.finite_number(-1e15), -1e15)
+        self.assertIsNone(server.finite_number(1e15 + 1))
+        self.assertIsNone(server.finite_number(-1.7e308))
+
+    def test_outbound_hostname_is_rejected_without_calling_resolver(self):
+        started = time.monotonic()
+        with patch("p2pool_lab.devices.socket.getaddrinfo") as resolve:
+            with self.assertRaisesRegex(OSError, "numeric IP addresses"):
+                server.request("http://miner.example/", timeout=1)
+            resolve.assert_not_called()
+        self.assertLess(time.monotonic() - started, 0.5)
+
     def test_request_rejects_redirects_instead_of_following_them(self):
         target_hits = []
 
@@ -475,6 +662,59 @@ class DashboardTests(unittest.TestCase):
             server.request(f"http://127.0.0.1:{redirect.server_port}/start")
         self.assertEqual(target_hits, [])
 
+    def test_slow_response_body_is_cut_off_by_total_deadline(self):
+        class SlowDrip(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "128")
+                self.end_headers()
+                for _ in range(128):
+                    try:
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+                    time.sleep(0.03)
+
+            def log_message(self, *args):
+                pass
+
+        running = ThreadingHTTPServer(("127.0.0.1", 0), SlowDrip)
+        self.addCleanup(running.server_close)
+        self.addCleanup(running.shutdown)
+        threading.Thread(target=running.serve_forever, daemon=True).start()
+        started = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            server.request(f"http://127.0.0.1:{running.server_port}/", timeout=0.2)
+        self.assertLess(time.monotonic() - started, 1)
+
+    def test_slow_response_headers_are_cut_off_by_absolute_deadline(self):
+        class SlowHeaders(BaseHTTPRequestHandler):
+            def do_GET(self):
+                response = (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                    b"Content-Type: application/json\r\nConnection: close\r\n\r\n{}"
+                )
+                for byte in response:
+                    try:
+                        self.wfile.write(bytes((byte,)))
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+                    time.sleep(0.03)
+
+            def log_message(self, *args):
+                pass
+
+        running = ThreadingHTTPServer(("127.0.0.1", 0), SlowHeaders)
+        self.addCleanup(running.server_close)
+        self.addCleanup(running.shutdown)
+        threading.Thread(target=running.serve_forever, daemon=True).start()
+        started = time.monotonic()
+        with self.assertRaises((OSError, http.client.HTTPException)):
+            server.request(f"http://127.0.0.1:{running.server_port}/", timeout=0.2)
+        self.assertLess(time.monotonic() - started, 1)
+
     def test_miner_api_filters_credentials(self):
         with patch.object(
             server,
@@ -509,6 +749,48 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(info["vrTemp"], 25)
         alerts = server.build_alerts({"miner-100": {"ok": True, "data": info}})
         self.assertIn("sensor is unavailable", alerts[0]["message"])
+
+    def test_huge_version_digits_cannot_disable_miner_polling(self):
+        with patch.object(
+            server,
+            "request",
+            return_value={"version": "2.14." + "9" * 5000},
+        ):
+            info = server.miner_status("100")
+        self.assertEqual(len(info["version"]), 64)
+        self.assertIn("pause", info["supported_actions"])
+
+    def test_metrics_block_timestamps_are_sanitized_in_full_state(self):
+        valid_hash = "ab" * 32
+        lines = ["bitcoin_blocks_found_total 4"]
+        for timestamp in ("nan", "inf", "1e9999"):
+            lines.append(
+                f'bitcoin_block_found_time_seconds{{blockhash="{valid_hash}",'
+                f'miner="tb1q-other",network="testnet5"}} {timestamp}'
+            )
+        lines.append(
+            f'bitcoin_block_found_time_seconds{{blockhash="{valid_hash}",'
+            f'miner="tb1q-other",network="testnet5"}} 100'
+        )
+
+        def fetch(url, **kwargs):
+            if url.endswith("chain_info"):
+                return {"chain_tip_height": 20}
+            if url.endswith("peers"):
+                return []
+            return "\n".join(lines)
+
+        with (
+            patch.object(self.monitor.registry, "devices", return_value={}),
+            patch.object(server, "request", side_effect=fetch),
+            patch.object(server, "bitcoin_status", return_value={"blocks": 50}),
+        ):
+            self.monitor.collect()
+        state = self.monitor.snapshot()
+        json.dumps(state, allow_nan=False).encode("utf-8")
+        blocks = state["sources"]["metrics"]["data"]["blocks"]
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["timestamp"], 100)
 
     def test_history_retains_zero_and_null_samples(self):
         now = int(time.time())
@@ -562,6 +844,53 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(history[0]["power"], 35)
         self.assertEqual(history[0]["temperature"], 65)
 
+    def test_baseline_extreme_history_values_are_safe_at_read_and_http_boundary(self):
+        now = int(time.time())
+        with self.monitor.connect() as connection:
+            for miner_id in ("100", "110"):
+                connection.execute(
+                    "INSERT INTO miner_samples VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        miner_id,
+                        now,
+                        1.7e308,
+                        1.7e308,
+                        1.7e308,
+                        1.7e308,
+                        1.7e308,
+                        20,
+                        40,
+                    ),
+                )
+        rows = self.monitor.history(1, "fleet")
+        self.assertTrue(rows)
+        for row in rows:
+            for field in ("hashrate", "temperature", "power", "accepted", "rejected"):
+                self.assertIsNone(row[field])
+        json.dumps(rows, allow_nan=False)
+        individual = self.monitor.history(1, "100")
+        json.dumps(individual, allow_nan=False)
+        self.assertIsNone(individual[0]["hashrate"])
+
+        running = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        running.monitor = self.monitor
+        threading.Thread(target=running.serve_forever, daemon=True).start()
+        self.addCleanup(running.server_close)
+        self.addCleanup(running.shutdown)
+        client = http.client.HTTPConnection("127.0.0.1", running.server_port)
+        self.addCleanup(client.close)
+        client.request(
+            "GET",
+            "/api/history?hours=1&miner=fleet",
+            headers={"Host": f"{server.HOST}:{server.PORT}"},
+        )
+        response = client.getresponse()
+        body = response.read()
+        self.assertEqual(response.status, 200)
+        history = json.loads(body)
+        json.dumps(history, allow_nan=False)
+        self.assertIsNone(history[0]["hashrate"])
+
     def test_old_firmware_unsupported_control_never_sends_post(self):
         with (
             patch.object(
@@ -586,6 +915,83 @@ class DashboardTests(unittest.TestCase):
         request.assert_called_once_with(
             "http://192.0.2.110/api/system/restart", "POST", {}
         )
+
+    def test_log_message_handles_single_argument_log_errors(self):
+        handler = object.__new__(server.Handler)
+        with patch.object(server.logging, "info") as log:
+            handler.log_message("%s", "socket error")
+            log.assert_called_once_with("%s", "socket error")
+            log.reset_mock()
+            handler.log_message('"%s" %s %s', "GET / HTTP/1.1", "200", "10")
+            log.assert_not_called()
+
+    def test_api_get_rejects_cross_site_fetch_but_not_navigation_or_static(self):
+        running = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        running.monitor = self.monitor
+        threading.Thread(target=running.serve_forever, daemon=True).start()
+        self.addCleanup(running.server_close)
+        self.addCleanup(running.shutdown)
+        host = f"{server.HOST}:{server.PORT}"
+        client = http.client.HTTPConnection("127.0.0.1", running.server_port)
+        self.addCleanup(client.close)
+        with patch.object(self.monitor, "snapshot", return_value={}) as snapshot:
+            client.request(
+                "GET",
+                "/api/state",
+                headers={"Host": host, "Sec-Fetch-Site": "cross-site"},
+            )
+            response = client.getresponse()
+            self.assertEqual(response.status, 403)
+            response.read()
+            snapshot.assert_not_called()
+            client.request(
+                "GET",
+                "/api/state",
+                headers={"Host": host, "Sec-Fetch-Site": "same-origin"},
+            )
+            response = client.getresponse()
+            self.assertEqual(response.status, 200)
+            response.read()
+            snapshot.assert_called_once_with()
+            client.request(
+                "GET",
+                "/api/state",
+                headers={"Host": host, "Sec-Fetch-Site": "none"},
+            )
+            response = client.getresponse()
+            self.assertEqual(response.status, 200)
+            response.read()
+        for path in ("/", "/app.js"):
+            client.request(
+                "GET", path, headers={"Host": host, "Sec-Fetch-Site": "cross-site"}
+            )
+            response = client.getresponse()
+            self.assertEqual(response.status, 200)
+            response.read()
+
+    def test_non_ascii_dashboard_token_is_rejected_without_server_error(self):
+        running = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        running.monitor = self.monitor
+        threading.Thread(target=running.serve_forever, daemon=True).start()
+        self.addCleanup(running.server_close)
+        self.addCleanup(running.shutdown)
+        client = http.client.HTTPConnection("127.0.0.1", running.server_port)
+        self.addCleanup(client.close)
+        with patch.object(self.monitor, "action") as action:
+            client.request(
+                "POST",
+                "/api/miner/100/identify",
+                body="{}",
+                headers={
+                    "Host": f"{server.HOST}:{server.PORT}",
+                    "Origin": server.ORIGIN,
+                    "X-Dashboard-Token": "é",
+                },
+            )
+            response = client.getresponse()
+            self.assertEqual(response.status, 403)
+            response.read()
+            action.assert_not_called()
 
     def test_http_controls_reject_cross_origin_and_unknown_actions(self):
         running_server = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)

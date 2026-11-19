@@ -1,12 +1,23 @@
 from contextlib import contextmanager
+import http.client
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import socket
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
-from p2pool_lab.devices import DeviceRegistry, fleet_summary, probe, scan_network
+from p2pool_lab.devices import (
+    DeadlineHTTPConnection,
+    DeviceRegistry,
+    fleet_summary,
+    probe,
+    scan_network,
+)
 
 
 class DeviceTests(unittest.TestCase):
@@ -15,6 +26,9 @@ class DeviceTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name) / "devices.sqlite"
         self.registry = DeviceRegistry(self.connect, {})
+        self.addCleanup(
+            self.registry.executor.shutdown, wait=False, cancel_futures=True
+        )
 
     @contextmanager
     def connect(self):
@@ -25,6 +39,19 @@ class DeviceTests(unittest.TestCase):
                 yield connection
         finally:
             connection.close()
+
+    def test_numeric_ip_uses_numeric_only_address_resolution(self):
+        connection = DeadlineHTTPConnection("192.0.2.1")
+        with patch("p2pool_lab.devices.socket.getaddrinfo", return_value=[]) as resolve:
+            with self.assertRaises(OSError):
+                connection._deadline_create_connection(("192.0.2.1", 80), 1, None)
+        resolve.assert_called_once_with(
+            "192.0.2.1",
+            80,
+            0,
+            socket.SOCK_STREAM,
+            flags=socket.AI_NUMERICHOST,
+        )
 
     def test_add_is_idempotent_and_inventory_survives_restart(self):
         device = {
@@ -117,6 +144,13 @@ class DeviceTests(unittest.TestCase):
         }
         response = MagicMock()
         response.__enter__.return_value = response
+
+        def read_chunk(size):
+            body = response.read(size)
+            response.read.return_value = b""
+            return body
+
+        response.read1.side_effect = read_chunk
         with patch("p2pool_lab.devices.build_opener") as opener:
             opener.return_value.open.return_value = response
             for model in ("BM1370", "BZM", "Custom ASIC"):
@@ -137,6 +171,158 @@ class DeviceTests(unittest.TestCase):
                     }
                     response.read.return_value = json.dumps(incomplete).encode()
                     self.assertIsNone(probe("192.168.50.2"))
+
+    def test_header_trickle_does_not_hold_discovery_open(self):
+        class SlowHeaders(BaseHTTPRequestHandler):
+            def do_GET(self):
+                response = (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                    b"Content-Type: application/json\r\nConnection: close\r\n\r\n{}"
+                )
+                for byte in response:
+                    try:
+                        self.wfile.write(bytes((byte,)))
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+                    time.sleep(0.03)
+
+            def log_message(self, *args):
+                pass
+
+        running = ThreadingHTTPServer(("127.0.0.1", 0), SlowHeaders)
+        self.addCleanup(running.server_close)
+        self.addCleanup(running.shutdown)
+        threading.Thread(target=running.serve_forever, daemon=True).start()
+        with (
+            patch(
+                "p2pool_lab.devices.private_address",
+                return_value=f"127.0.0.1:{running.server_port}",
+            ),
+            patch("p2pool_lab.devices.PROBE_TIMEOUT", 0.2),
+            patch("p2pool_lab.devices.DISCOVERY_GRACE", 0.5),
+        ):
+            started = time.monotonic()
+            self.registry._scan(["192.168.50.2"])
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1)
+        self.assertTrue(all(future.done() for future in self.registry._probe_futures))
+        self.assertEqual(self.registry.scan["checked"], 1)
+        self.assertIsNone(self.registry.scan["error"])
+
+    def test_probe_rejects_bad_http_status_and_pathological_json(self):
+        with patch("p2pool_lab.devices.build_opener") as opener:
+            opener.return_value.open.side_effect = http.client.BadStatusLine("bad")
+            self.assertIsNone(probe("192.168.50.2"))
+
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read1.side_effect = [b"{}", b""]
+        with (
+            patch("p2pool_lab.devices.build_opener") as opener,
+            patch("p2pool_lab.devices.json.loads", side_effect=RecursionError),
+        ):
+            opener.return_value.open.return_value = response
+            self.assertIsNone(probe("192.168.50.2"))
+
+    def test_probe_bounds_discovery_strings(self):
+        body = json.dumps(
+            {
+                "ASICModel": "M" * 100,
+                "hostname": "H" * 100,
+                "version": "V" * 100,
+                "macAddr": "12:34:56:78:9A:BC",
+                "hashRate": 850,
+            }
+        ).encode()
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read1.side_effect = [body, b""]
+        with patch("p2pool_lab.devices.build_opener") as opener:
+            opener.return_value.open.return_value = response
+            found = probe("192.168.50.2")
+        self.assertEqual(len(found["name"]), 64)
+        self.assertEqual(len(found["model"]), 64)
+        self.assertEqual(len(found["version"]), 32)
+
+    def test_one_bad_future_does_not_abort_remaining_discovery(self):
+        found = {
+            "address": "192.168.50.2",
+            "mac": "123456789abc",
+            "name": "Bitaxe",
+            "model": "BM1370",
+            "version": "v2.15.4",
+        }
+
+        def probing(address):
+            if address.endswith(".1"):
+                raise http.client.BadStatusLine("not HTTP")
+            return found
+
+        with patch("p2pool_lab.devices.probe", side_effect=probing):
+            self.registry._scan(["192.168.50.1", "192.168.50.2"])
+        result = self.registry.discovery()
+        self.assertEqual(result["checked"], 2)
+        self.assertEqual(result["results"], [{**found, "registered": False}])
+        self.assertIsNone(result["error"])
+        self.assertFalse(result["running"])
+
+    def test_config_url_collision_preserves_inventory_and_other_rows(self):
+        existing = {
+            "mac": "123456789abc",
+            "name": "Dashboard device",
+        }
+        with patch("p2pool_lab.devices.probe", return_value=existing):
+            added = self.registry.add("192.168.50.2")
+        with self.assertLogs(level="WARNING"):
+            restarted = DeviceRegistry(
+                self.connect,
+                {
+                    "100": {
+                        "name": "Conflicting config",
+                        "url": "http://192.168.50.2",
+                        "worker": "conflict",
+                    },
+                    "110": {
+                        "name": "Other config",
+                        "url": "http://192.168.50.3",
+                        "worker": "other",
+                    },
+                },
+            )
+        devices = restarted.devices()
+        self.assertIn(added["id"], devices)
+        self.assertIn("110", devices)
+        self.assertNotIn("100", devices)
+        self.assertEqual(len(devices), 2)
+
+    def test_extreme_fleet_values_never_create_non_finite_aggregates(self):
+        sources = {
+            "miner-one": {
+                "ok": True,
+                "updated_at": 99,
+                "data": {
+                    "hashRate": 1e15,
+                    "power": 1.7e308,
+                    "sharesAccepted": 2**63 - 1,
+                },
+            },
+            "miner-two": {
+                "ok": True,
+                "updated_at": 99,
+                "data": {
+                    "hashRate": 1e15,
+                    "power": float("inf"),
+                    "sharesAccepted": 2**63 - 1,
+                },
+            },
+        }
+        summary = fleet_summary(sources, {"one": {}, "two": {}}, 100)
+        json.dumps(summary, allow_nan=False)
+        self.assertIsNone(summary["hashRate"])
+        self.assertIsNone(summary["power"])
+        self.assertIsNone(summary["sharesAccepted"])
+        self.assertIsNone(summary["temp"])
 
     def test_fleet_sums_hashrate_and_power_but_uses_hottest_temperature(self):
         sources = {

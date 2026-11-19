@@ -40,10 +40,16 @@ Open **http://127.0.0.1:8080/**. `init` prints the Stratum settings and backup
 location. Allow rbitcoin and then the P2Pool share chain to synchronize before
 connecting a miner. `Ctrl-C` stops the foreground stack.
 
-For LAN access, set both `network.bind_host` and `network.public_host` to your
-host's LAN IPv4 address. If listening on `0.0.0.0`, set `public_host` to the
-address or hostname your browser and miners actually use. Use a DHCP reservation.
-`public_host` is also checked for dashboard browser origins.
+For LAN miners, set `network.bind_host` to your host's LAN IPv4 address. That
+controls the Stratum, P2Pool share-peer, and P2Pool API/explorer listeners
+(the API requires the generated credentials, but is still best kept off
+untrusted networks). The wallet dashboard binds
+to a separate `network.dashboard_host`, which stays on loopback unless you set
+it explicitly to a LAN address (or `0.0.0.0`). Set `network.public_host` to the
+address or hostname your browser and miners actually use; with
+`dashboard_host = "0.0.0.0"` the dashboard origin is derived from
+`public_host`, which is also checked for dashboard browser origins. Use a DHCP
+reservation.
 
 Configure miner firmware with the Stratum host/port printed by `init`, your
 Bitcoin payout address as the username, and password `x`. The independent share
@@ -53,6 +59,29 @@ All runtime state defaults to **`~/.local/share/p2pool-lab`**, outside the check
 The initializer calls BDK's existing descriptor generator for two independent
 wallets. It does not implement entropy generation or private-key derivation.
 Repeated initialization preserves existing wallets and RPC credentials.
+
+Initialization also generates P2Pool API credentials once and stores them in
+**`data/p2pool-api-auth.json`** under the state directory with owner-only
+(0600) permissions. The file holds the API username, password, salt, and the
+HMAC-SHA256 token written to the pool node's `[api]` section. The dashboard
+sends these credentials automatically on its P2Pool API requests, and the
+username and password are also the login for the upstream P2Pool explorer
+served on the API port. They are never printed to logs or placed in the public
+TOML/Nix settings, and repeated initialization preserves them.
+
+**Upgrading from an older release:** state directories initialized before API
+credentials existed keep an unauthenticated pool config until it is refreshed.
+Every `pool`, `run`, `dashboard`, and `status` command re-renders the node
+configuration under the state-directory lock before the pool can start, so an
+upgraded installation picks up authentication automatically on the next
+launch. If the runtime state is incomplete, startup fails with instructions
+rather than running the pool unauthenticated.
+
+Configuration also migrates: `[miners.*]` entries that used a DNS name or an
+IPv6 address must be changed to the miner's IPv4 literal before the lab will
+start, because outbound miner HTTP targets are numeric-only (a stalled
+resolver cannot be interrupted by the request deadline). Dashboard-added
+devices already use IPv4 addresses; only the public TOML needs editing.
 
 ### Keep it running
 
@@ -70,12 +99,18 @@ want operation without a logged-in session.
 
 ### Firewall
 
-Open the chosen Stratum/dashboard/explorer TCP ports to your LAN. For example,
-adapt this to your actual interface, subnet, address, and ports:
+Open only the TCP ports you actually use on your LAN. For example, adapt this
+to your actual interface, subnet, address, and ports:
 
 ```sh
-sudo ufw allow in on <interface> proto tcp from <LAN-CIDR> to <node-LAN-IP> port 3333,8080,46884 comment 'P2Pool LAN'
+sudo ufw allow in on <interface> proto tcp from <LAN-CIDR> to <node-LAN-IP> port 3333 comment 'P2Pool Stratum'
+sudo ufw allow in on <interface> proto tcp from <LAN-CIDR> to <node-LAN-IP> port 8080 comment 'P2Pool dashboard'
 ```
+
+Stratum (3333) is needed for miners. The dashboard (8080) is only reachable
+from the LAN when `dashboard_host` is set to a LAN address. The pool
+API/explorer port (46884) is only needed for direct LAN access to the upstream
+explorer, which requires the generated API login.
 
 A connection from the node to itself does not test inbound firewall access.
 Verify a real miner connects and accepted shares increase. RPC, Electrum, Esplora,
@@ -95,6 +130,9 @@ Under **Discover & manage miners**:
 Discovery does not follow redirects or scan public networks. It does not change
 miner settings. Device identity is tracked by MAC address to deduplicate adds and
 preserve a miner's history when explicitly re-added at a new DHCP address.
+Miner URLs — configured or discovered — are IPv4 literals; DNS names are
+rejected so every outbound request keeps an absolute deadline even if a
+resolver stalls.
 Removing a miner stops monitoring, frees its address in the inventory, and keeps
 its historical samples until normal retention expires.
 
@@ -135,14 +173,24 @@ nix run . -- --config config.toml status
 
 ## Access model
 
-The default dashboard is loopback-only. Anyone you allow to access the dashboard
-can operate its miner controls **and testnet wallet**. Mutations check the Host,
+The dashboard binds to `network.dashboard_host`, loopback by default, while
+`network.bind_host` affects the Stratum, P2Pool share-peer, and authenticated
+P2Pool API/explorer listeners. Adding
+LAN miners therefore does not expose the dashboard; LAN dashboard access is a
+separate, explicit setting. Anyone you allow to access the dashboard can
+operate its miner controls **and testnet wallet**. Mutations check the Host,
 same-origin browser Origin, and a dashboard token; these checks prevent
 cross-origin requests but are not user authentication. Put authenticated remote
 access in front of it if you share it beyond trusted local operators.
 
-Wallet private descriptors and RPC credentials are runtime files with owner-only
-permissions. Dashboard responses contain public metadata, never private keys.
+The P2Pool API (including `POST/DELETE /blocked_ips`) requires HTTP Basic
+authentication with the credentials generated at initialization. The dashboard
+sends them automatically; the upstream explorer login accepts the same username
+and password.
+
+Wallet private descriptors, RPC credentials, and P2Pool API credentials are
+runtime files with owner-only permissions. Dashboard responses contain public
+metadata, never private keys.
 
 ## Nix and reproducibility
 
@@ -178,6 +226,7 @@ Add this flake as an input and import `inputs.p2pool-lab.nixosModules.default`:
     enable = true;
     settings.network = {
       bind_host = "127.0.0.1";
+      dashboard_host = "127.0.0.1";
       public_host = "127.0.0.1";
     };
   };
