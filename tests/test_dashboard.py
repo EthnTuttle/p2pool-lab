@@ -2,6 +2,7 @@
 
 import http.client
 from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import tempfile
@@ -9,6 +10,7 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 from p2pool_lab import dashboard as server
 
@@ -170,7 +172,9 @@ class DashboardTests(unittest.TestCase):
         with (
             patch.object(server, "request", side_effect=batches) as request,
             patch.object(server.time, "time", return_value=8101),
-            patch.object(server, "bitcoin_rpc", return_value={"coinbasevalue": 6048000}),
+            patch.object(
+                server, "bitcoin_rpc", return_value={"coinbasevalue": 6048000}
+            ),
         ):
             page = self.monitor.owner_shares(199)
 
@@ -183,7 +187,12 @@ class DashboardTests(unittest.TestCase):
         )
         self.assertEqual(
             [call.args[0].rsplit("/", 1)[1] for call in request.call_args_list],
-            ["shares?num=100", "chain_info", "shares?num=100&to=199", "shares?num=100&to=99"],
+            [
+                "shares?num=100",
+                "chain_info",
+                "shares?num=100&to=199",
+                "shares?num=100&to=99",
+            ],
         )
         self.assertEqual(
             [share["payout_from_height"] for share in page["shares"]], [151, 106]
@@ -249,7 +258,9 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(estimate(*partial, 10), 1000)
         self.assertEqual(estimate(*partial, 9), 900)
         self.assertEqual(estimate(*partial, 11), 1100)
-        self.assertEqual(estimate(120_960_000, 500_000, 249_999, 250_000, 0x207FFFFF, 10), 1000)
+        self.assertEqual(
+            estimate(120_960_000, 500_000, 249_999, 250_000, 0x207FFFFF, 10), 1000
+        )
         self.assertIsNone(estimate(120_960_000, 500_000, 249_999, 250_000, 0, 10))
 
     def test_lab_block_count_includes_finds_older_than_the_recent_table(self):
@@ -315,6 +326,104 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(
             self.monitor.snapshot()["sources"]["miner-110"]["data"]["hashRate"], 900
         )
+
+    def test_badly_typed_miner_fields_do_not_stop_the_collection_cycle(self):
+        def fetch(url, **kwargs):
+            if url.endswith("chain_info"):
+                return {"chain_tip_height": 20}
+            if url.endswith("peers"):
+                return []
+            if url.endswith("/api/system/info"):
+                if "192.0.2.100" in url:
+                    return {
+                        "version": 1,
+                        "hashRate": "fast",
+                        "temp": "hot",
+                        "temp2": [],
+                        "vrTemp": {},
+                        "power": {"watts": 15},
+                        "coreVoltageActual": "low",
+                        "sharesAccepted": "10",
+                        "sharesRejected": None,
+                        "poolConnectionInfo": [],
+                        "power_fault": {"reason": "test"},
+                        "overheat_mode": {"bad": True},
+                    }
+                return {
+                    "version": "v2.15.4",
+                    "hashRate": 900,
+                    "temp": 60,
+                    "power": 15,
+                    "sharesAccepted": 2,
+                    "sharesRejected": 0,
+                }
+            return "shares_accepted_total 0\n"
+
+        with (
+            patch.object(server, "request", side_effect=fetch),
+            patch.object(server, "bitcoin_status", return_value={"blocks": 50}),
+        ):
+            self.monitor.collect()
+
+        state = self.monitor.snapshot()
+        self.assertTrue(state["sources"]["miner-100"]["ok"])
+        self.assertTrue(state["sources"]["miner-110"]["ok"])
+        self.assertEqual(state["sources"]["miner-110"]["data"]["hashRate"], 900)
+        malformed = state["sources"]["miner-100"]["data"]
+        self.assertIsNone(malformed["hashRate"])
+        self.assertIsNone(malformed["temp"])
+        self.assertIsNone(malformed["power"])
+        self.assertIsNone(malformed["coreVoltageActual"])
+        self.assertEqual(malformed["poolConnectionInfo"], [])
+        with self.monitor.connect() as connection:
+            rows = {
+                row["miner"]: row["hashrate"]
+                for row in connection.execute(
+                    "SELECT miner, hashrate FROM miner_samples WHERE timestamp=?",
+                    (state["updated_at"],),
+                )
+            }
+        self.assertEqual(rows, {"100": None, "110": 900})
+
+    def test_request_rejects_redirects_instead_of_following_them(self):
+        target_hits = []
+
+        class Target(BaseHTTPRequestHandler):
+            def do_GET(self):
+                target_hits.append(self.path)
+                body = b"{}"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        target = ThreadingHTTPServer(("127.0.0.1", 0), Target)
+        self.addCleanup(target.server_close)
+        self.addCleanup(target.shutdown)
+        threading.Thread(target=target.serve_forever, daemon=True).start()
+
+        class Redirect(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header(
+                    "Location", f"http://127.0.0.1:{target.server_port}/secret"
+                )
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        redirect = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+        self.addCleanup(redirect.server_close)
+        self.addCleanup(redirect.shutdown)
+        threading.Thread(target=redirect.serve_forever, daemon=True).start()
+
+        with self.assertRaises(HTTPError):
+            server.request(f"http://127.0.0.1:{redirect.server_port}/start")
+        self.assertEqual(target_hits, [])
 
     def test_miner_api_filters_credentials(self):
         with patch.object(

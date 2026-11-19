@@ -21,7 +21,7 @@ class NoRedirect(HTTPRedirectHandler):
         raise HTTPError(
             request.full_url,
             code,
-            "Discovery does not follow redirects",
+            "Redirects are not followed",
             headers,
             response,
         )
@@ -113,9 +113,17 @@ class DeviceRegistry:
 
     def identify(self, identifier, mac):
         normalized = str(mac or "").lower().replace(":", "")
-        if not re.fullmatch(r"[0-9a-f]{12}", normalized):
-            return True
+        valid = re.fullmatch(r"[0-9a-f]{12}", normalized) is not None
         with self.connect() as connection:
+            device = connection.execute(
+                "SELECT mac FROM devices WHERE id=?", (identifier,)
+            ).fetchone()
+            if device is None:
+                return False
+            if not valid:
+                # A missing or malformed MAC cannot confirm an entry that is
+                # already pinned. Only unpinned entries may be adopted later.
+                return device["mac"] is None
             owner = connection.execute(
                 "SELECT id FROM devices WHERE mac=?", (normalized,)
             ).fetchone()

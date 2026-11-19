@@ -18,11 +18,11 @@ import subprocess
 import threading
 import time
 from urllib.parse import parse_qs, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from .wallet_api import WalletError, WalletService
 from .config import GENESIS, load
-from .devices import DeviceRegistry, fleet_summary
+from .devices import DeviceRegistry, NoRedirect, fleet_summary
 
 CONFIG = load()
 ROOT = CONFIG.state_dir
@@ -99,6 +99,51 @@ MINER_FIELDS = (
     "macAddr",
 )
 ACTIONS = {"pause", "resume", "restart", "identify", "configure-pool"}
+NUMERIC_FIELDS = frozenset(
+    {
+        "hashRate",
+        "hashRate_1m",
+        "hashRate_10m",
+        "hashRate_1h",
+        "expectedHashrate",
+        "power",
+        "voltage",
+        "current",
+        "temp",
+        "temp2",
+        "vrTemp",
+        "coreVoltageActual",
+        "frequency",
+        "actualFrequency",
+        "coreVoltage",
+        "fanspeed",
+        "fanrpm",
+        "fan2rpm",
+        "sharesAccepted",
+        "sharesRejected",
+        "bestDiff",
+        "bestSessionDiff",
+        "poolDifficulty",
+        "responseTime",
+        "uptimeSeconds",
+        "wifiRSSI",
+        "stratumPort",
+        "fallbackStratumPort",
+        "stratumSuggestedDifficulty",
+        "manualFanSpeed",
+        "temptarget",
+        "primaryPoolIndex",
+        "secondaryPoolIndex",
+        "workReceived",
+    }
+)
+OPENER = build_opener(ProxyHandler({}), NoRedirect())
+
+
+def finite_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value if math.isfinite(value) else None
 
 
 def request(url, method="GET", data=None, headers=None, text=False):
@@ -106,7 +151,7 @@ def request(url, method="GET", data=None, headers=None, text=False):
     if data is not None:
         headers["Content-Type"] = "application/json"
     payload = None if data is None else json.dumps(data).encode()
-    with urlopen(
+    with OPENER.open(
         Request(url, data=payload, headers=headers, method=method), timeout=4
     ) as response:
         if text:
@@ -130,7 +175,11 @@ def recent_share_interval(shares, now):
     lowest = min(shares, key=lambda share: share["height"])
     height_span = highest["height"] - lowest["height"]
     elapsed = highest["timestamp"] - lowest["timestamp"]
-    if height_span <= 0 or elapsed <= 0 or not -300 <= now - highest["timestamp"] <= 900:
+    if (
+        height_span <= 0
+        or elapsed <= 0
+        or not -300 <= now - highest["timestamp"] <= 900
+    ):
         return None
     return elapsed / height_span
 
@@ -149,8 +198,12 @@ def estimate_share_sats(reward_sats, chain_work, tip, paying_height, bits, weigh
         return None
     # Project the payout window using mean work per confirmed height, including
     # uncle work. Work is proportional to payout difficulty at mining targets.
-    return reward_sats * share_work * weight * (tip + 1) // (
-        10 * chain_work * eligible_count
+    return (
+        reward_sats
+        * share_work
+        * weight
+        * (tip + 1)
+        // (10 * chain_work * eligible_count)
     )
 
 
@@ -183,16 +236,22 @@ def miner_status(miner_id, url=None):
     info["pool_config_format"] = (
         "array" if isinstance(info.get("pools"), list) else "legacy"
     )
-    version = re.search(r"(\d+)\.(\d+)\.(\d+)", info.get("version", ""))
+    version_text = info.get("version")
+    version = (
+        re.search(r"(\d+)\.(\d+)\.(\d+)", version_text)
+        if isinstance(version_text, str)
+        else None
+    )
     modern = version and tuple(map(int, version.groups())) >= (2, 14, 0)
     info["supported_actions"] = sorted(
         ACTIONS if modern else {"restart", "configure-pool"}
     )
+    for field in NUMERIC_FIELDS:
+        if field in info:
+            info[field] = finite_number(info[field])
     for field in ("temp", "temp2", "vrTemp"):
         value = info.get(field)
-        if value is not None and (
-            not isinstance(value, (float, int)) or not math.isfinite(value) or value < 0
-        ):
+        if value is not None and value < 0:
             info[field] = None
     return {key: info[key] for key in MINER_FIELDS if key in info}
 
@@ -246,12 +305,16 @@ def build_alerts(sources, miners=None):
             continue
         label = f"Bitaxe .{miner_id}"
         info = miner["data"]
+        if not isinstance(info, dict):
+            continue
         if info.get("power_fault"):
             alerts.append(
                 {"level": "danger", "message": f"{label}: {info['power_fault']}"}
             )
-        if info.get("temp") is None:
-            if info.get("coreVoltageActual", 100) < 100:
+        temp = finite_number(info.get("temp"))
+        if temp is None:
+            voltage = finite_number(info.get("coreVoltageActual"))
+            if voltage is not None and voltage < 100:
                 alerts.append(
                     {
                         "level": "warning",
@@ -265,18 +328,19 @@ def build_alerts(sources, miners=None):
                         "message": f"{label} ASIC temperature sensor is unavailable.",
                     }
                 )
-        elif info["temp"] >= 80:
+        elif temp >= 80:
             alerts.append(
                 {
                     "level": "danger",
-                    "message": f"{label} reports {info['temp']:.1f} °C ASIC temperature.",
+                    "message": f"{label} reports {temp:.1f} °C ASIC temperature.",
                 }
             )
         if info.get("overheat_mode"):
             alerts.append(
                 {"level": "danger", "message": f"{label} overheat mode is active."}
             )
-        if "not connected" in info.get("poolConnectionInfo", "").lower():
+        connection = info.get("poolConnectionInfo")
+        if isinstance(connection, str) and "not connected" in connection.lower():
             alerts.append(
                 {
                     "level": "warning",
@@ -409,7 +473,7 @@ class Monitor:
             if self.owner_history_tip:
                 previous = self.owner_history_tip
                 if previous["height"] <= tip["height"]:
-                    checkpoint = request(f'{shares_url}?num=1&to={previous["height"]}')
+                    checkpoint = request(f"{shares_url}?num=1&to={previous['height']}")
                     if checkpoint["shares"][0]["blockhash"] == previous["blockhash"]:
                         start = previous["height"] + 1
                         heights = self.owner_history_heights.copy()
@@ -421,11 +485,14 @@ class Monitor:
                 if batch["to_height"] != end or len(batch["shares"]) != count:
                     raise RuntimeError("Share history changed while loading")
                 for share in batch["shares"]:
-                    if any(entry["miner_address"] == owner for entry in [share, *share["uncles"]]):
+                    if any(
+                        entry["miner_address"] == owner
+                        for entry in [share, *share["uncles"]]
+                    ):
                         heights.append(share["height"])
                 end = batch["from_height"] - 1
 
-            checkpoint = request(f'{shares_url}?num=1&to={tip["height"]}')
+            checkpoint = request(f"{shares_url}?num=1&to={tip['height']}")
             if checkpoint["shares"][0]["blockhash"] != tip["blockhash"]:
                 raise RuntimeError("Share history changed while loading")
             self.owner_history_tip = tip
@@ -563,19 +630,20 @@ class Monitor:
         with self.connect() as connection:
             for miner_id in miners:
                 source = sources["miner-" + miner_id]
-                miner = source["data"] if source["ok"] else {}
+                data = source.get("data") if source.get("ok") else None
+                miner = data if isinstance(data, dict) else {}
                 connection.execute(
                     "INSERT OR REPLACE INTO miner_samples VALUES (?,?,?,?,?,?,?,?,?)",
                     (
                         miner_id,
                         timestamp,
-                        miner.get("hashRate"),
-                        miner.get("temp"),
-                        miner.get("power"),
-                        miner.get("sharesAccepted"),
-                        miner.get("sharesRejected"),
-                        bitcoin.get("blocks"),
-                        chain.get("chain_tip_height"),
+                        finite_number(miner.get("hashRate")),
+                        finite_number(miner.get("temp")),
+                        finite_number(miner.get("power")),
+                        finite_number(miner.get("sharesAccepted")),
+                        finite_number(miner.get("sharesRejected")),
+                        finite_number(bitcoin.get("blocks")),
+                        finite_number(chain.get("chain_tip_height")),
                     ),
                 )
             connection.execute(

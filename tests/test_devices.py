@@ -67,6 +67,34 @@ class DeviceTests(unittest.TestCase):
             second = self.registry.add("192.168.50.2")
         self.assertNotEqual(first["id"], second["id"])
 
+    def test_identify_rejects_missing_or_malformed_mac_when_entry_is_pinned(self):
+        with patch(
+            "p2pool_lab.devices.probe",
+            return_value={"mac": "123456789abc", "name": "Bitaxe"},
+        ):
+            device = self.registry.add("192.168.50.2")
+        for mac in (None, "", "not-a-mac", "123456789ab"):
+            with self.subTest(mac=mac):
+                self.assertFalse(self.registry.identify(device["id"], mac))
+        self.assertTrue(self.registry.identify(device["id"], "12:34:56:78:9A:BC"))
+
+    def test_identify_adopts_mac_once_for_unpinned_configured_device(self):
+        registry = DeviceRegistry(
+            self.connect,
+            {
+                "100": {
+                    "name": "Configured",
+                    "url": "http://192.168.50.2",
+                    "worker": "bitaxe602",
+                }
+            },
+        )
+        self.assertTrue(registry.identify("100", None))
+        self.assertTrue(registry.identify("100", "123456789abc"))
+        self.assertFalse(registry.identify("100", None))
+        self.assertTrue(registry.identify("100", "123456789abc"))
+        self.assertFalse(registry.identify("100", "223456789abc"))
+
     def test_scan_rejects_public_network_and_oversized_lan(self):
         with self.assertRaises(ValueError):
             scan_network("8.8.8.0/24")
@@ -98,11 +126,15 @@ class DeviceTests(unittest.TestCase):
                     self.assertEqual(probe("192.168.50.2")["model"], model)
             for model in ("", "   ", None, 1370):
                 with self.subTest(invalid_model=model):
-                    response.read.return_value = json.dumps({**info, "ASICModel": model}).encode()
+                    response.read.return_value = json.dumps(
+                        {**info, "ASICModel": model}
+                    ).encode()
                     self.assertIsNone(probe("192.168.50.2"))
             for field in ("ASICModel", "macAddr", "hashRate"):
                 with self.subTest(missing=field):
-                    incomplete = {key: value for key, value in info.items() if key != field}
+                    incomplete = {
+                        key: value for key, value in info.items() if key != field
+                    }
                     response.read.return_value = json.dumps(incomplete).encode()
                     self.assertIsNone(probe("192.168.50.2"))
 
