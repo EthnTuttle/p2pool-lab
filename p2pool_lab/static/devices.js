@@ -59,12 +59,14 @@
       remove.title = "Remove from dashboard monitoring";
       remove.addEventListener("click", () => removeDevice(id));
       buttons.append(select, remove); actions.append(buttons);
-      row.append(element("td", device.name), element("td", device.url), element("td", device.worker), actions);
+      const identity = element("td", device.mac ? "Pinned" : "Not pinned yet", device.mac ? undefined : "muted");
+      identity.title = device.mac ? "Device MAC is pinned to this entry" : "No MAC recorded yet; it will pin on the first valid response";
+      row.append(element("td", device.name), element("td", device.url), element("td", device.worker), identity, actions);
       return row;
     });
     if (!rows.length) {
       const row = element("tr"), cell = element("td", "Discover your LAN or add a Bitaxe IP to begin.", "empty");
-      cell.colSpan = 4; row.append(cell); rows.push(row);
+      cell.colSpan = 5; row.append(cell); rows.push(row);
     }
     byId("registered-devices").replaceChildren(...rows);
     renderFound();

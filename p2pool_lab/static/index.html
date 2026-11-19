@@ -85,7 +85,7 @@
       <div class="device-forms"><form id="discovery-form"><label for="discovery-cidr">LAN subnet · /24 or smaller</label><div class="inline-form"><input id="discovery-cidr" placeholder="192.168.1.0/24" required><button id="discover-button" type="submit">Discover</button></div></form><form id="add-device-form"><label for="add-device-ip">Add a miner by IP</label><div class="inline-form"><input id="add-device-ip" placeholder="192.168.1.123" required><button id="add-device-button" type="submit">Add miner</button></div></form></div>
       <p class="footnote">Discovery checks AxeOS over HTTP on the chosen private LAN. Adding a miner starts monitoring; use its pool control separately to configure mining.</p>
       <div id="discovery-status" class="action-result" role="status"></div><div id="discovered-devices"></div>
-      <div class="table-wrap"><table><thead><tr><th>Registered miner</th><th>Address</th><th>Worker name</th><th>Actions</th></tr></thead><tbody id="registered-devices"><tr><td colspan="4" class="empty">No miners configured yet.</td></tr></tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>Registered miner</th><th>Address</th><th>Worker name</th><th>Identity</th><th>Actions</th></tr></thead><tbody id="registered-devices"><tr><td colspan="5" class="empty">No miners configured yet.</td></tr></tbody></table></div>
     </section>
     <section class="panel wallet-ui" id="wallet">
       <div class="panel-heading"><div><p class="eyebrow">BDK · BITCOIN TESTNET5</p><h2>Your wallet</h2></div><button id="wallet-refresh">Refresh wallet</button></div>
