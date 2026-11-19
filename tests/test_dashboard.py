@@ -385,6 +385,56 @@ class DashboardTests(unittest.TestCase):
             }
         self.assertEqual(rows, {"100": None, "110": 900})
 
+    def test_out_of_range_integer_telemetry_cannot_stop_collection(self):
+        def fetch(url, **kwargs):
+            if url.endswith("chain_info"):
+                return {"chain_tip_height": 20}
+            if url.endswith("peers"):
+                return []
+            if url.endswith("/api/system/info"):
+                if "192.0.2.100" in url:
+                    return {
+                        "hashRate": 2**63,
+                        "temp": 55,
+                        "power": 15,
+                        "sharesAccepted": 1,
+                        "sharesRejected": 0,
+                    }
+                return {"hashRate": 900, "temp": 60, "power": 15}
+            return "shares_accepted_total 0\n"
+
+        with (
+            patch.object(server, "request", side_effect=fetch),
+            patch.object(server, "bitcoin_status", return_value={"blocks": 50}),
+        ):
+            self.monitor.collect()
+
+        state = self.monitor.snapshot()
+        self.assertTrue(state["sources"]["miner-100"]["ok"])
+        self.assertTrue(state["sources"]["miner-110"]["ok"])
+        self.assertIsNone(state["sources"]["miner-100"]["data"]["hashRate"])
+        self.assertEqual(state["sources"]["miner-110"]["data"]["hashRate"], 900)
+        with self.monitor.connect() as connection:
+            rows = {
+                row["miner"]: row["hashrate"]
+                for row in connection.execute(
+                    "SELECT miner, hashrate FROM miner_samples WHERE timestamp=?",
+                    (state["updated_at"],),
+                )
+            }
+        self.assertEqual(rows, {"100": None, "110": 900})
+
+    def test_finite_number_rejects_values_sqlite_cannot_bind(self):
+        self.assertEqual(server.finite_number(2**63 - 1), 2**63 - 1)
+        self.assertEqual(server.finite_number(-(2**63)), -(2**63))
+        for value in (2**63, -(2**63) - 1, 10**309):
+            with self.subTest(value=value):
+                self.assertIsNone(server.finite_number(value))
+        self.assertIsNone(server.finite_number(float("inf")))
+        self.assertIsNone(server.finite_number(float("nan")))
+        self.assertIsNone(server.finite_number(True))
+        self.assertEqual(server.finite_number(0), 0)
+
     def test_request_rejects_redirects_instead_of_following_them(self):
         target_hits = []
 

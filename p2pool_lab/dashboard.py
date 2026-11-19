@@ -138,12 +138,18 @@ NUMERIC_FIELDS = frozenset(
     }
 )
 OPENER = build_opener(ProxyHandler({}), NoRedirect())
+SQLITE_INT_MIN, SQLITE_INT_MAX = -(2**63), 2**63 - 1
 
 
 def finite_number(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return value if math.isfinite(value) else None
+    if isinstance(value, int):
+        return value if SQLITE_INT_MIN <= value <= SQLITE_INT_MAX else None
+    try:
+        return value if math.isfinite(value) else None
+    except OverflowError:
+        return None
 
 
 def request(url, method="GET", data=None, headers=None, text=False):
@@ -632,20 +638,27 @@ class Monitor:
                 source = sources["miner-" + miner_id]
                 data = source.get("data") if source.get("ok") else None
                 miner = data if isinstance(data, dict) else {}
-                connection.execute(
-                    "INSERT OR REPLACE INTO miner_samples VALUES (?,?,?,?,?,?,?,?,?)",
-                    (
+                try:
+                    connection.execute(
+                        "INSERT OR REPLACE INTO miner_samples VALUES (?,?,?,?,?,?,?,?,?)",
+                        (
+                            miner_id,
+                            timestamp,
+                            finite_number(miner.get("hashRate")),
+                            finite_number(miner.get("temp")),
+                            finite_number(miner.get("power")),
+                            finite_number(miner.get("sharesAccepted")),
+                            finite_number(miner.get("sharesRejected")),
+                            finite_number(bitcoin.get("blocks")),
+                            finite_number(chain.get("chain_tip_height")),
+                        ),
+                    )
+                except (OverflowError, sqlite3.Error):
+                    logging.warning(
+                        "Could not store sample for Bitaxe .%s",
                         miner_id,
-                        timestamp,
-                        finite_number(miner.get("hashRate")),
-                        finite_number(miner.get("temp")),
-                        finite_number(miner.get("power")),
-                        finite_number(miner.get("sharesAccepted")),
-                        finite_number(miner.get("sharesRejected")),
-                        finite_number(bitcoin.get("blocks")),
-                        finite_number(chain.get("chain_tip_height")),
-                    ),
-                )
+                        exc_info=True,
+                    )
             connection.execute(
                 "DELETE FROM miner_samples WHERE timestamp < ?",
                 (timestamp - 7 * 86400,),
